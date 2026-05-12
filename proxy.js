@@ -738,6 +738,87 @@ function reverseMap(text, config) {
   return r;
 }
 
+function buildReversePatterns(config) {
+  const patterns = [];
+  for (const [orig, cc] of config.toolRenames) {
+    patterns.push(['"' + cc + '"', '"' + orig + '"']);
+    patterns.push(['\\"' + cc + '\\"', '\\"' + orig + '\\"']);
+  }
+  for (const [orig, renamed] of config.propRenames) {
+    patterns.push(['"' + renamed + '"', '"' + orig + '"']);
+    patterns.push(['\\"' + renamed + '\\"', '\\"' + orig + '\\"']);
+  }
+  for (const [sanitized, original] of config.reverseMap) {
+    patterns.push([sanitized, original]);
+  }
+  return patterns.filter(([find]) => find.length > 0);
+}
+
+function applyReversePatterns(text, patterns) {
+  let r = text;
+  for (const [find, replace] of patterns) {
+    r = r.split(find).join(replace);
+  }
+  return r;
+}
+
+function findPotentialPatternSuffix(text, patterns) {
+  const maxLen = patterns.reduce((max, [find]) => Math.max(max, find.length), 0);
+  const limit = Math.min(text.length, Math.max(0, maxLen - 1));
+  for (let len = limit; len > 0; len--) {
+    const suffix = text.slice(-len);
+    if (patterns.some(([find]) => find.startsWith(suffix))) {
+      return len;
+    }
+  }
+  return 0;
+}
+
+class StreamingReverseMapper {
+  constructor(patterns) {
+    this.patterns = patterns;
+    this.pending = '';
+  }
+
+  process(text) {
+    const joined = this.pending + text;
+    const holdLen = findPotentialPatternSuffix(joined, this.patterns);
+    const ready = joined.slice(0, joined.length - holdLen);
+    this.pending = joined.slice(joined.length - holdLen);
+    return applyReversePatterns(ready, this.patterns);
+  }
+
+  flush() {
+    const out = applyReversePatterns(this.pending, this.patterns);
+    this.pending = '';
+    return out;
+  }
+}
+
+function getSseDataLine(event) {
+  const match = /(^|\n)data: ?/.exec(event);
+  if (!match) return null;
+  const prefixLen = match[0].length;
+  const dataStart = match.index + prefixLen;
+  const dataEnd = event.indexOf('\n', dataStart);
+  return {
+    start: dataStart,
+    end: dataEnd === -1 ? event.length : dataEnd,
+    value: event.slice(dataStart, dataEnd === -1 ? event.length : dataEnd)
+  };
+}
+
+function replaceSseDataLine(event, value) {
+  const data = getSseDataLine(event);
+  if (!data) return event;
+  return event.slice(0, data.start) + value + event.slice(data.end);
+}
+
+function makeContentBlockDeltaEvent(index, delta) {
+  return 'event: content_block_delta\n'
+    + 'data: ' + JSON.stringify({ type: 'content_block_delta', index, delta }) + '\n\n';
+}
+
 // ─── Server ─────────────────────────────────────────────────────────────────
 function startServer(config) {
   let requestCount = 0;
@@ -842,15 +923,13 @@ function startServer(config) {
           });
           return;
         }
-        // SSE streaming — event-aware reverseMap. Buffer until a complete SSE
-        // event arrives (terminated by \n\n), then transform per event. This
-        // subsumes the older tail-buffer fix for patterns split across TCP
-        // chunks (#11) because SSE events are self-contained, so patterns
-        // can't span event boundaries. It also lets us track the current
-        // content block type across events and pass thinking/redacted_thinking
-        // bytes through unchanged — Anthropic rejects the next turn otherwise
-        // with "thinking blocks in the latest assistant message cannot be
-        // modified."
+        // SSE streaming — transform complete SSE events as they arrive, while
+        // keeping tiny per-field tail buffers for text_delta and
+        // input_json_delta values. Anthropic may split those logical strings
+        // across multiple events, so a plain per-event reverseMap can miss a
+        // renamed token whose prefix is at the end of one event and suffix is
+        // at the start of the next. Thinking blocks still pass through
+        // unchanged because Anthropic enforces byte equality on replay.
         if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
           const sseHeaders = { ...upRes.headers };
           delete sseHeaders['content-length'];      // SSE is streamed, no fixed length
@@ -861,36 +940,103 @@ function startServer(config) {
           // don't decode as U+FFFD.
           const decoder = new StringDecoder('utf8');
           let pending = '';
-          let currentBlockIsThinking = false;
+          const thinkingBlocks = new Set();
+          const reversePatterns = buildReversePatterns(config);
+          const fieldBuffers = new Map();
+
+          const bufferKey = (index, field) => `${index}:${field}`;
+          const getFieldBuffer = (index, field) => {
+            const key = bufferKey(index, field);
+            let mapper = fieldBuffers.get(key);
+            if (!mapper) {
+              mapper = new StreamingReverseMapper(reversePatterns);
+              fieldBuffers.set(key, mapper);
+            }
+            return mapper;
+          };
+
+          const flushField = (index, field) => {
+            const key = bufferKey(index, field);
+            const mapper = fieldBuffers.get(key);
+            if (!mapper) return '';
+            const value = mapper.flush();
+            fieldBuffers.delete(key);
+            if (!value) return '';
+            const deltaType = field === 'partial_json' ? 'input_json_delta' : 'text_delta';
+            const delta = field === 'partial_json'
+              ? { type: deltaType, partial_json: value }
+              : { type: deltaType, text: value };
+            return makeContentBlockDeltaEvent(index, delta);
+          };
+
+          const flushBlock = (index) => {
+            return flushField(index, 'text') + flushField(index, 'partial_json');
+          };
+
+          const flushAllFields = () => {
+            let out = '';
+            for (const key of [...fieldBuffers.keys()]) {
+              const [index, field] = key.split(':');
+              out += flushField(Number(index), field);
+            }
+            return out;
+          };
 
           const transformEvent = (event) => {
-            // Locate the data: line (always at the start of an SSE line)
-            let dataIdx = event.startsWith('data: ') ? 0 : event.indexOf('\ndata: ');
-            if (dataIdx === -1) return reverseMap(event, config);
-            if (dataIdx > 0) dataIdx += 1; // skip the leading \n
-            const dataLineEnd = event.indexOf('\n', dataIdx + 6);
-            const dataStr = dataLineEnd === -1
-              ? event.slice(dataIdx + 6)
-              : event.slice(dataIdx + 6, dataLineEnd);
+            const dataLine = getSseDataLine(event);
+            if (!dataLine) return reverseMap(event, config);
+            const dataStr = dataLine.value.trim();
+            if (dataStr === '[DONE]') {
+              return flushAllFields() + event;
+            }
 
-            if (dataStr.indexOf('"type":"content_block_start"') !== -1) {
-              if (dataStr.indexOf('"content_block":{"type":"thinking"') !== -1 ||
-                  dataStr.indexOf('"content_block":{"type":"redacted_thinking"') !== -1) {
-                currentBlockIsThinking = true;
-                return event; // pass through unchanged
-              }
-              currentBlockIsThinking = false;
+            let payload;
+            try {
+              payload = JSON.parse(dataStr);
+            } catch(e) {
               return reverseMap(event, config);
             }
-            if (dataStr.indexOf('"type":"content_block_stop"') !== -1) {
-              const wasThinking = currentBlockIsThinking;
-              currentBlockIsThinking = false;
-              return wasThinking ? event : reverseMap(event, config);
+
+            const index = typeof payload.index === 'number' ? payload.index : null;
+            if (payload.type === 'content_block_start') {
+              const blockType = payload.content_block && payload.content_block.type;
+              if (index !== null && (blockType === 'thinking' || blockType === 'redacted_thinking')) {
+                thinkingBlocks.add(index);
+                return event;
+              }
+              return reverseMap(event, config);
             }
-            if (currentBlockIsThinking) {
-              // thinking_delta / signature_delta / etc. inside a thinking block
+
+            if (payload.type === 'content_block_stop') {
+              if (index !== null && thinkingBlocks.has(index)) {
+                thinkingBlocks.delete(index);
+                return event;
+              }
+              const flushed = index === null ? '' : flushBlock(index);
+              return flushed + reverseMap(event, config);
+            }
+
+            if (index !== null && thinkingBlocks.has(index)) {
               return event;
             }
+
+            if (payload.type === 'content_block_delta' && index !== null && payload.delta) {
+              if (payload.delta.type === 'text_delta' && typeof payload.delta.text === 'string') {
+                payload.delta.text = getFieldBuffer(index, 'text').process(payload.delta.text);
+                if (payload.delta.text.length === 0) return '';
+                return reverseMap(replaceSseDataLine(event, JSON.stringify(payload)), config);
+              }
+              if (payload.delta.type === 'input_json_delta' && typeof payload.delta.partial_json === 'string') {
+                payload.delta.partial_json = getFieldBuffer(index, 'partial_json').process(payload.delta.partial_json);
+                if (payload.delta.partial_json.length === 0) return '';
+                return reverseMap(replaceSseDataLine(event, JSON.stringify(payload)), config);
+              }
+            }
+
+            if (payload.type === 'message_stop' || payload.type === 'message_delta') {
+              return flushAllFields() + reverseMap(event, config);
+            }
+
             return reverseMap(event, config);
           };
 
@@ -910,6 +1056,7 @@ function startServer(config) {
               // well-formed SSE, but flush to avoid silent drops.
               res.write(transformEvent(pending));
             }
+            res.write(flushAllFields());
             res.end();
           });
         } else {

@@ -1,4 +1,7 @@
 config.json
+keys.json
+proxy.js.bak.*
+raw-dumps/
 node_modules/
 *.log
 .env

@@ -10,7 +10,7 @@ After Anthropic revoked subscription billing for third-party tools (April 4, 202
 
 ## How It Works
 
-The proxy performs 7-layer bidirectional request/response processing to defeat Anthropic's multi-layer detection:
+The proxy performs bidirectional request/response processing to defeat Anthropic's multi-layer detection while preserving OpenClaw semantics:
 
 **Outbound (request to API):**
 1. **Billing Header** -- Injects an 84-character Claude Code billing identifier into the system prompt
@@ -20,9 +20,11 @@ The proxy performs 7-layer bidirectional request/response processing to defeat A
 5. **System Template Bypass** -- Strips ~28K of structured config sections and replaces with a ~0.5K natural prose paraphrase
 6. **Tool Description Stripping** -- Removes tool descriptions to reduce fingerprint signal
 7. **Property Renaming** -- Renames OC-specific schema properties (e.g., `session_id` -> `thread_id`)
+8. **Request Guard Rails** -- Optional API-key authentication, request deduplication, and diagnostic request dumps
 
 **Inbound (response to OpenClaw):**
-8. **Full Reverse Mapping** -- Restores ALL original tool names, property names, file paths, and identifiers in both SSE streaming chunks and JSON responses
+9. **Full Reverse Mapping** -- Restores ALL original tool names, property names, file paths, and identifiers in both SSE streaming chunks and JSON responses
+10. **Response Guard Rails** -- Optional response deduplication and raw upstream dumps for production forensics
 
 This ensures Anthropic sees what looks like a Claude Code session while OpenClaw sees its original tool names, paths, and identifiers.
 
@@ -187,6 +189,38 @@ See `.env.example` for all available environment variables.
 
 > **Note:** macOS Keychain credential extraction does not work inside Docker. Use the `~/.claude` volume mount (default) or set `OAUTH_TOKEN` in `.env`.
 
+### API Key Authentication
+
+Client requests must include an API key in either `x-api-key` or `Authorization: Bearer ...`. The proxy stores only SHA256 hashes in a keys file, defaulting to `/etc/billing-proxy/keys.json` or the `KEYS_FILE` environment variable.
+
+Example `keys.json`:
+
+```json
+[
+  {"name":"OpenClaw","key_hash":"<sha256 hex of API key>"}
+]
+```
+
+Generate a hash without printing the secret in shell history:
+
+```bash
+read -rsp 'API key: ' KEY; echo
+KEY="$KEY" node -e "const crypto=require('crypto'); console.log(crypto.createHash('sha256').update(process.env.KEY).digest('hex'))"
+unset KEY
+```
+
+### Production Diagnostics
+
+These optional environment variables are useful for debugging duplicate output or provider payload issues. Dumps may contain full prompt and response data, so keep the dump directory private.
+
+```bash
+BILLING_PROXY_REQUEST_DUMP=1      # write transformed request bodies + summaries
+BILLING_PROXY_RAW_DUMP=1          # write raw upstream response bodies
+BILLING_PROXY_DUMP_DIR=/etc/billing-proxy/raw-dumps
+BILLING_PROXY_REQUEST_DEDUP=1     # remove adjacent duplicate assistant messages before upstream send
+BILLING_PROXY_RESPONSE_DEDUP=1    # suppress repeated response tails in streaming output
+```
+
 ### Linux (systemd)
 ```bash
 sudo tee /etc/systemd/system/openclaw-proxy.service << EOF
@@ -233,7 +267,7 @@ Claude Code's OAuth token expires every ~24 hours. The proxy reads the token fre
 curl http://127.0.0.1:18801/health
 ```
 
-Returns token status, request count, uptime, subscription type, and pattern counts.
+Returns token status, request count, uptime, subscription type, active version, and pattern counts.
 
 ## How Anthropic's Detection Works (Updated April 8, 2026)
 
@@ -290,7 +324,7 @@ This tests 8 layers independently (credentials, token, API, billing header, trig
 
 **Proxy returns 400 "out of extra usage" (v2)**
 - If you upgraded from v1.x: the old string-only sanitization no longer works. You need v2.0's full 7-layer processing. Make sure you're running the new `proxy.js`.
-- Check `/health` endpoint -- it should show `version: "2.0.0"` and `layers` object.
+- Check `/health` endpoint -- it should show the current `version` and `layers` object.
 - If v2 is running and still failing: your OpenClaw version may have new tools not in the default rename list. Check the proxy console for `DETECTION!` log lines. Add custom tool renames to `config.json`.
 - If it was working and stopped: Anthropic may have added new detection. Check the repo for updates.
 

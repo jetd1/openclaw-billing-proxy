@@ -9,10 +9,18 @@ services:
     volumes:
       # Mount Claude Code credentials (read-only). Not needed if OAUTH_TOKEN is set.
       - ${HOME}/.claude:/root/.claude:ro
+      # API key hashes for client authentication. See README for format.
+      # - ./keys.json:/app/keys.json:ro
       # Uncomment to use custom replacement rules:
       # - ./config.json:/app/config.json:ro
     environment:
       - OAUTH_TOKEN=${OAUTH_TOKEN:-}        # Set in .env to skip credential file mount
+      - KEYS_FILE=${KEYS_FILE:-/app/keys.json}
+      - BILLING_PROXY_RAW_DUMP=${BILLING_PROXY_RAW_DUMP:-0}
+      - BILLING_PROXY_REQUEST_DUMP=${BILLING_PROXY_REQUEST_DUMP:-0}
+      - BILLING_PROXY_RESPONSE_DEDUP=${BILLING_PROXY_RESPONSE_DEDUP:-0}
+      - BILLING_PROXY_REQUEST_DEDUP=${BILLING_PROXY_REQUEST_DEDUP:-0}
+      - BILLING_PROXY_DUMP_DIR=${BILLING_PROXY_DUMP_DIR:-/tmp/billing-proxy-dumps}
       - PROXY_PORT=${PROXY_PORT:-}
       - PROXY_HOST=0.0.0.0                  # Required: container must bind all interfaces for port mapping
     healthcheck:

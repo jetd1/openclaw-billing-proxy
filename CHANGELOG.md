@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Sync production hardening patches
+
+**Changes:**
+- Added API-key authentication via a keys file of SHA256 key hashes.
+- Added optional request dump, raw upstream dump, request deduplication, and
+  response deduplication controls via BILLING_PROXY_* environment variables.
+- Added thinking-block masking around request and response transforms so
+  thinking / redacted_thinking history blocks are not mutated by raw
+  replacement pipelines.
+
+**Why:**
+These changes mirror the live deployment used by Jet's OpenClaw instance and
+keep the repository from drifting behind production hot patches.
+
+---
+
 ## v2.2.4 -- 2026-04-09
 
 ### Fix config strip boundary using filesystem paths instead of AGENTS.md (closes #26)

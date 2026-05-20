@@ -33,6 +33,7 @@ const { StringDecoder } = require('string_decoder');
 
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
+const DEFAULT_KEYS_FILE = process.env.KEYS_FILE || "/etc/billing-proxy/keys.json";
 const UPSTREAM_HOST = 'api.anthropic.com';
 const VERSION = '2.2.3';
 
@@ -405,6 +406,7 @@ function loadConfig() {
 
   return {
     port: envPort || cliPort || config.port || DEFAULT_PORT,
+    keysFile: DEFAULT_KEYS_FILE,
     credsPath,
     replacements,
     reverseMap,
@@ -795,6 +797,118 @@ class StreamingReverseMapper {
   }
 }
 
+const RESPONSE_DEDUP_MIN_BODY_CHARS = 240;
+const RESPONSE_DEDUP_MIN_MATCH_CHARS = 80;
+const RESPONSE_DEDUP_SEPARATORS = ['\n\n', '\r\n\r\n'];
+
+class StreamingRepeatDeduper {
+  constructor() {
+    this.emitted = '';
+    this.probe = '';
+    this.suppressing = false;
+    this.sepLen = 0;
+    this.matchPos = 0;
+    this.suppressedBuffer = '';
+    this.suppressedChars = 0;
+    this.suppressedCopies = 0;
+    this.falseStarts = 0;
+  }
+
+  canDetect() {
+    return this.emitted.length >= RESPONSE_DEDUP_MIN_BODY_CHARS;
+  }
+
+  candidateFor(probe) {
+    if (!this.canDetect()) return null;
+    for (const sep of RESPONSE_DEDUP_SEPARATORS) {
+      if (probe.length <= sep.length) {
+        if (sep.startsWith(probe)) return { sepLen: sep.length };
+        continue;
+      }
+      if (!probe.startsWith(sep)) continue;
+      const bodyPrefix = probe.slice(sep.length);
+      if (bodyPrefix.length <= this.emitted.length && this.emitted.startsWith(bodyPrefix)) {
+        return { sepLen: sep.length };
+      }
+    }
+    return null;
+  }
+
+  emit(text) {
+    if (!text) return '';
+    this.emitted += text;
+    return text;
+  }
+
+  resetSuppression() {
+    this.suppressing = false;
+    this.sepLen = 0;
+    this.matchPos = 0;
+    this.suppressedBuffer = '';
+  }
+
+  beginSuppression(sepLen) {
+    this.suppressing = true;
+    this.sepLen = sepLen;
+    this.matchPos = this.probe.length - sepLen;
+    this.suppressedBuffer = this.probe;
+    this.probe = '';
+  }
+
+  process(text) {
+    if (!text) return '';
+    let out = '';
+    for (const ch of text) {
+      if (this.suppressing) {
+        const expected = this.emitted[this.matchPos];
+        if (ch === expected) {
+          this.suppressedBuffer += ch;
+          this.matchPos++;
+          if (this.matchPos >= this.emitted.length) {
+            this.suppressedChars += this.suppressedBuffer.length;
+            this.suppressedCopies++;
+            this.resetSuppression();
+          }
+          continue;
+        }
+        out += this.emit(this.suppressedBuffer + ch);
+        this.falseStarts++;
+        this.resetSuppression();
+        continue;
+      }
+
+      this.probe += ch;
+      const candidate = this.candidateFor(this.probe);
+      if (candidate) {
+        if (this.probe.length >= candidate.sepLen + RESPONSE_DEDUP_MIN_MATCH_CHARS) {
+          this.beginSuppression(candidate.sepLen);
+        }
+        continue;
+      }
+      out += this.emit(this.probe);
+      this.probe = '';
+    }
+    return out;
+  }
+
+  flush() {
+    let out = '';
+    if (this.suppressing) {
+      if (this.matchPos >= RESPONSE_DEDUP_MIN_MATCH_CHARS) {
+        this.suppressedChars += this.suppressedBuffer.length;
+      } else {
+        out += this.emit(this.suppressedBuffer);
+      }
+      this.resetSuppression();
+    }
+    if (this.probe) {
+      out += this.emit(this.probe);
+      this.probe = '';
+    }
+    return out;
+  }
+}
+
 function getSseDataLine(event) {
   const match = /(^|\n)data: ?/.exec(event);
   if (!match) return null;
@@ -817,6 +931,145 @@ function replaceSseDataLine(event, value) {
 function makeContentBlockDeltaEvent(index, delta) {
   return 'event: content_block_delta\n'
     + 'data: ' + JSON.stringify({ type: 'content_block_delta', index, delta }) + '\n\n';
+}
+
+function textFromContent(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map((part) => {
+    if (!part || typeof part !== 'object') return '';
+    if (typeof part.text === 'string') return part.text;
+    if (typeof part.content === 'string') return part.content;
+    if (typeof part.thinking === 'string') return part.thinking;
+    return '';
+  }).filter(Boolean).join('\n');
+}
+
+function buildRequestDumpSummary(reqNum, url, originalSize, transformedBody) {
+  const summary = {
+    reqNum,
+    url,
+    capturedAt: new Date().toISOString(),
+    originalBytes: originalSize,
+    bodyBytes: Buffer.byteLength(transformedBody, 'utf8'),
+    bodySha256: crypto.createHash('sha256').update(transformedBody).digest('hex')
+  };
+  try {
+    const parsed = JSON.parse(transformedBody);
+    const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
+    const systemText = textFromContent(parsed.system);
+    const lastMessages = messages.slice(-8).map((message, offset) => {
+      const text = textFromContent(message && message.content);
+      return {
+        index: messages.length - Math.min(messages.length, 8) + offset,
+        role: message && message.role,
+        textChars: text.length,
+        textHead: text.slice(0, 240),
+        textTail: text.slice(-240)
+      };
+    });
+    Object.assign(summary, {
+      model: parsed.model,
+      stream: parsed.stream,
+      max_tokens: parsed.max_tokens,
+      stop_sequences: parsed.stop_sequences,
+      temperature: parsed.temperature,
+      top_p: parsed.top_p,
+      thinking: parsed.thinking,
+      systemChars: systemText.length,
+      messagesCount: messages.length,
+      lastRoles: lastMessages.map((message) => message.role),
+      trailingAssistantPrefill: messages.length > 0 && messages[messages.length - 1]?.role === 'assistant',
+      lastMessages
+    });
+  } catch (error) {
+    summary.parseError = error && error.message ? error.message : String(error);
+  }
+  return summary;
+}
+
+function maybeDumpRequest(reqNum, req, originalSize, transformedBody) {
+  if (process.env.BILLING_PROXY_REQUEST_DUMP !== '1') return;
+  const dumpDir = process.env.BILLING_PROXY_DUMP_DIR || '/etc/billing-proxy/raw-dumps';
+  try {
+    fs.mkdirSync(dumpDir, { recursive: true, mode: 0o700 });
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+    const prefix = path.join(dumpDir, `${stamp}-req-${reqNum}`);
+    fs.writeFileSync(`${prefix}.body.json`, transformedBody, { mode: 0o600 });
+    const summary = buildRequestDumpSummary(reqNum, req.url, originalSize, transformedBody);
+    fs.writeFileSync(`${prefix}.summary.json`, JSON.stringify(summary, null, 2), { mode: 0o600 });
+    console.log(`[REQUEST-DUMP] #${reqNum} ${prefix}.body.json`);
+  } catch (error) {
+    console.error(`[REQUEST-DUMP-ERROR] #${reqNum} ${error && error.stack ? error.stack : error}`);
+  }
+}
+
+function assistantContentKey(message) {
+  return JSON.stringify(message && Object.prototype.hasOwnProperty.call(message, 'content') ? message.content : null);
+}
+
+function isEmptyAssistantMessage(message) {
+  if (!message || message.role !== 'assistant') return false;
+  const content = message.content;
+  if (content == null) return true;
+  if (typeof content === 'string') return content.trim().length === 0;
+  if (!Array.isArray(content)) return false;
+  if (content.length === 0) return true;
+  return content.every((part) => {
+    if (!part || typeof part !== 'object') return true;
+    const type = part.type || 'text';
+    if (type !== 'text') return false;
+    return typeof part.text !== 'string' || part.text.trim().length === 0;
+  });
+}
+
+function maybeDedupRequestBody(reqNum, bodyStr) {
+  if (process.env.BILLING_PROXY_REQUEST_DEDUP !== '1') return bodyStr;
+  try {
+    const parsed = JSON.parse(bodyStr);
+    if (!Array.isArray(parsed.messages)) return bodyStr;
+
+    const kept = [];
+    let removedAdjacent = 0;
+    let removedEmpty = 0;
+    for (const message of parsed.messages) {
+      if (isEmptyAssistantMessage(message)) {
+        removedEmpty++;
+        continue;
+      }
+      const previous = kept[kept.length - 1];
+      if (message && message.role === 'assistant' &&
+          previous && previous.role === 'assistant' &&
+          assistantContentKey(previous) === assistantContentKey(message)) {
+        removedAdjacent++;
+        continue;
+      }
+      kept.push(message);
+    }
+
+    if (removedAdjacent === 0 && removedEmpty === 0) return bodyStr;
+    parsed.messages = kept;
+    const nextBody = JSON.stringify(parsed);
+    console.log(`[REQUEST-DEDUP] #${reqNum} removedAdjacent=${removedAdjacent} removedEmpty=${removedEmpty} messages=${kept.length}`);
+    return nextBody;
+  } catch (error) {
+    console.error(`[REQUEST-DEDUP-ERROR] #${reqNum} ${error && error.stack ? error.stack : error}`);
+    return bodyStr;
+  }
+}
+
+// ─── API Key Auth ─────────────────────────────────────────────────────────────
+let _keysCache = null;
+function loadKeysFile(filePath) {
+  if (!_keysCache || _keysCache.path !== filePath) {
+    try {
+      _keysCache = { path: filePath, keys: JSON.parse(fs.readFileSync(filePath, "utf8")), mtime: Date.now() };
+    } catch (e) {
+      console.error("Failed to load keys file:", e.message);
+      _keysCache = { path: filePath, keys: [], mtime: Date.now() };
+    }
+  }
+  return _keysCache.keys;
 }
 
 // ─── Server ─────────────────────────────────────────────────────────────────
@@ -854,6 +1107,16 @@ function startServer(config) {
       return;
     }
 
+    // API key authentication
+    const apiKey = (req.headers["x-api-key"] || "").trim() || (req.headers["authorization"] || "").replace(/^Bearer\s+/i, "").trim();
+    const keyHash = crypto.createHash("sha256").update(apiKey).digest("hex");
+    const validKeys = loadKeysFile(config.keysFile);
+    if (!validKeys.some(k => k.key_hash === keyHash)) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { type: "authentication_error", message: "invalid x-api-key" } }));
+      return;
+    }
+
     requestCount++;
     const reqNum = requestCount;
     const chunks = [];
@@ -871,7 +1134,9 @@ function startServer(config) {
       let bodyStr = body.toString('utf8');
       const originalSize = bodyStr.length;
       bodyStr = processBody(bodyStr, config);
+      bodyStr = maybeDedupRequestBody(reqNum, bodyStr);
       body = Buffer.from(bodyStr, 'utf8');
+      maybeDumpRequest(reqNum, req, originalSize, bodyStr);
 
       const headers = {};
       for (const [key, value] of Object.entries(req.headers)) {
@@ -943,6 +1208,8 @@ function startServer(config) {
           const thinkingBlocks = new Set();
           const reversePatterns = buildReversePatterns(config);
           const fieldBuffers = new Map();
+          const responseDedupEnabled = process.env.BILLING_PROXY_RESPONSE_DEDUP === '1';
+          const textDedupers = new Map();
 
           const bufferKey = (index, field) => `${index}:${field}`;
           const getFieldBuffer = (index, field) => {
@@ -955,17 +1222,45 @@ function startServer(config) {
             return mapper;
           };
 
+          const getTextDeduper = (index) => {
+            let deduper = textDedupers.get(index);
+            if (!deduper) {
+              deduper = new StreamingRepeatDeduper();
+              textDedupers.set(index, deduper);
+            }
+            return deduper;
+          };
+
+          const processTextForRepeat = (index, value) => {
+            if (!responseDedupEnabled || !value) return value;
+            return getTextDeduper(index).process(value);
+          };
+
+          const finishTextDeduper = (index) => {
+            const deduper = textDedupers.get(index);
+            if (!deduper) return '';
+            const value = deduper.flush();
+            textDedupers.delete(index);
+            if (deduper.suppressedChars > 0) {
+              console.log(`[RESPONSE-DEDUP] #${reqNum} block=${index} copies=${deduper.suppressedCopies} chars=${deduper.suppressedChars} falseStarts=${deduper.falseStarts}`);
+            }
+            return value;
+          };
+
           const flushField = (index, field) => {
             const key = bufferKey(index, field);
             const mapper = fieldBuffers.get(key);
             if (!mapper) return '';
             const value = mapper.flush();
             fieldBuffers.delete(key);
-            if (!value) return '';
+            const finalValue = field === 'text'
+              ? processTextForRepeat(index, value) + finishTextDeduper(index)
+              : value;
+            if (!finalValue) return '';
             const deltaType = field === 'partial_json' ? 'input_json_delta' : 'text_delta';
             const delta = field === 'partial_json'
-              ? { type: deltaType, partial_json: value }
-              : { type: deltaType, text: value };
+              ? { type: deltaType, partial_json: finalValue }
+              : { type: deltaType, text: finalValue };
             return makeContentBlockDeltaEvent(index, delta);
           };
 
@@ -1023,6 +1318,7 @@ function startServer(config) {
             if (payload.type === 'content_block_delta' && index !== null && payload.delta) {
               if (payload.delta.type === 'text_delta' && typeof payload.delta.text === 'string') {
                 payload.delta.text = getFieldBuffer(index, 'text').process(payload.delta.text);
+                payload.delta.text = processTextForRepeat(index, payload.delta.text);
                 if (payload.delta.text.length === 0) return '';
                 return reverseMap(replaceSseDataLine(event, JSON.stringify(payload)), config);
               }
@@ -1041,6 +1337,12 @@ function startServer(config) {
           };
 
           upRes.on('data', (chunk) => {
+            // Raw upstream dump for Bug #2 investigation (2026-05-13)
+            if (process.env.BILLING_PROXY_RAW_DUMP === '1') {
+              const ts = new Date().toISOString();
+              const chunkStr = chunk.toString('utf8');
+              process.stdout.write(`[RAW-UPSTREAM ${ts} #${reqNum}] ${JSON.stringify(chunkStr)}\n`);
+            }
             pending += decoder.write(chunk);
             let sepIdx;
             while ((sepIdx = pending.indexOf('\n\n')) !== -1) {

@@ -20,11 +20,12 @@ The proxy performs bidirectional request/response processing to defeat Anthropic
 5. **System Template Bypass** -- Strips ~28K of structured config sections and replaces with a ~0.5K natural prose paraphrase
 6. **Tool Description Stripping** -- Removes tool descriptions to reduce fingerprint signal
 7. **Property Renaming** -- Renames OC-specific schema properties (e.g., `session_id` -> `thread_id`)
-8. **Request Guard Rails** -- Optional API-key authentication, request deduplication, and diagnostic request dumps
+8. **Ultra Model Rewrite** -- Maps Cangjie-style `*-ultra` aliases to base Anthropic model names with top-level thinking overrides
+9. **Request Guard Rails** -- Optional API-key authentication, request deduplication, and diagnostic request dumps
 
 **Inbound (response to OpenClaw):**
-9. **Full Reverse Mapping** -- Restores ALL original tool names, property names, file paths, and identifiers in both SSE streaming chunks and JSON responses
-10. **Response Guard Rails** -- Optional response deduplication and raw upstream dumps for production forensics
+10. **Full Reverse Mapping** -- Restores ALL original tool names, property names, file paths, and identifiers in both SSE streaming chunks and JSON responses
+11. **Response Guard Rails** -- Optional response deduplication and raw upstream dumps for production forensics
 
 This ensures Anthropic sees what looks like a Claude Code session while OpenClaw sees its original tool names, paths, and identifiers.
 
@@ -220,6 +221,17 @@ BILLING_PROXY_DUMP_DIR=/etc/billing-proxy/raw-dumps
 BILLING_PROXY_REQUEST_DEDUP=1     # remove adjacent duplicate assistant messages before upstream send
 BILLING_PROXY_RESPONSE_DEDUP=1    # suppress repeated response tails in streaming output
 ```
+
+### Ultra Model Aliases
+
+The proxy recognizes Cangjie-compatible `-ultra` model aliases before the normal OpenClaw sanitization pipeline:
+
+- `claude-opus-4-7-ultra` -> `claude-opus-4-7` with `thinking: {"type":"adaptive"}` and `output_config: {"effort":"max"}`
+- `claude-opus-4-6-ultra` -> `claude-opus-4-6` with `thinking: {"type":"enabled","budget_tokens":112000}`
+- `claude-sonnet-4-6-ultra` -> `claude-sonnet-4-6` with `thinking: {"type":"enabled","budget_tokens":48000}`
+- Unknown `*-ultra` aliases only strip the suffix and do not inject thinking overrides
+
+The rewrite scans only the top-level `model` key, so nested history or streamed response content is not used to trigger the override.
 
 ### Linux (systemd)
 ```bash

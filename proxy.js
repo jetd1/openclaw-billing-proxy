@@ -518,6 +518,166 @@ function unmaskThinkingBlocks(m, masks) {
   return m;
 }
 
+// ─── Ultra Model Rewrite ──────────────────────────────────────────────────
+// Replicates Cangjie's -ultra model override logic. Applied BEFORE processBody
+// so that the model name rewrite happens before tool/string sanitization.
+// Uses top-level JSON key scanning only (no JSON.parse) to preserve thinking/
+// redacted_thinking block byte integrity.
+
+const ULTRA_MODELS = {
+  'claude-opus-4-7-ultra': {
+    model: 'claude-opus-4-7',
+    thinking: '{"type":"adaptive"}',
+    output_config: '{"effort":"max"}',
+    removeEffort: true,
+  },
+  'claude-opus-4-6-ultra': {
+    model: 'claude-opus-4-6',
+    thinking: '{"type":"enabled","budget_tokens":112000}',
+    output_config: null,
+    removeEffort: true,
+  },
+  'claude-sonnet-4-6-ultra': {
+    model: 'claude-sonnet-4-6',
+    thinking: '{"type":"enabled","budget_tokens":48000}',
+    output_config: null,
+    removeEffort: true,
+  },
+};
+
+function findTopLevelKey(s, key) {
+  const searchForKey = '"' + key + '"';
+  let depth = 0, inStr = false;
+  const openBrace = s.indexOf('{');
+  if (openBrace === -1) return -1;
+  let strStart = -1;
+  for (let i = openBrace + 1; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === '"') {
+        inStr = false;
+        if (depth === 0 && s.slice(strStart, i + 1) === searchForKey) {
+          let j = i + 1;
+          while (j < s.length && ' \t\n\r'.includes(s[j])) j++;
+          if (s[j] === ':') return strStart;
+        }
+      }
+      continue;
+    }
+    if (c === '"') { inStr = true; strStart = i; continue; }
+    if (c === '{' || c === '[') { depth++; continue; }
+    if (c === '}') { if (depth === 0) break; depth--; continue; }
+    if (c === ']') { depth--; continue; }
+  }
+  return -1;
+}
+
+function findValueEnd(s, start) {
+  let i = start;
+  while (i < s.length && ' \t\n\r'.includes(s[i])) i++;
+  if (i >= s.length) return i;
+  const c = s[i];
+  if (c === '"') {
+    i++;
+    while (i < s.length) { if (s[i] === '\\') { i += 2; continue; } if (s[i] === '"') { i++; break; } i++; }
+  } else if (c === '{') {
+    let d = 1, inS = false;
+    i++;
+    while (i < s.length) {
+      if (inS) { if (s[i] === '\\') { i++; continue; } if (s[i] === '"') inS = false; i++; continue; }
+      if (s[i] === '"') { inS = true; i++; continue; }
+      if (s[i] === '{') d++;
+      if (s[i] === '}') { d--; if (d === 0) { i++; break; } }
+      i++;
+    }
+  } else if (c === '[') {
+    let d = 1, inS = false;
+    i++;
+    while (i < s.length) {
+      if (inS) { if (s[i] === '\\') { i++; continue; } if (s[i] === '"') inS = false; i++; continue; }
+      if (s[i] === '"') { inS = true; i++; continue; }
+      if (s[i] === '[') d++;
+      if (s[i] === ']') { d--; if (d === 0) { i++; break; } }
+      i++;
+    }
+  } else {
+    while (i < s.length && s[i] !== ',' && s[i] !== '}') i++;
+  }
+  return i;
+}
+
+function removeTopLevelKey(s, key) {
+  const keyQuoteIdx = findTopLevelKey(s, key);
+  if (keyQuoteIdx === -1) return s;
+  let colonIdx = keyQuoteIdx + ('"' + key + '"').length;
+  while (colonIdx < s.length && ' \t\n\r'.includes(s[colonIdx])) colonIdx++;
+  const valStart = colonIdx + 1;
+  const valEnd = findValueEnd(s, valStart);
+  let pairStart = keyQuoteIdx;
+  let hasPrecedingComma = false;
+  for (let j = keyQuoteIdx - 1; j >= 0; j--) {
+    if (s[j] === ',') { pairStart = j; hasPrecedingComma = true; break; }
+    if (s[j] === '{') { pairStart = j + 1; break; }
+    if (s[j] !== ' ' && s[j] !== '\n' && s[j] !== '\r' && s[j] !== '\t') break;
+  }
+  let pairEnd = valEnd;
+  if (!hasPrecedingComma) {
+    while (pairEnd < s.length && ' \t\n\r'.includes(s[pairEnd])) pairEnd++;
+    if (s[pairEnd] === ',') pairEnd++;
+  }
+  return s.slice(0, pairStart) + s.slice(pairEnd);
+}
+
+function replaceOrInsertTopLevelKey(s, key, valueJson) {
+  const keyQuoteIdx = findTopLevelKey(s, key);
+  if (keyQuoteIdx !== -1) {
+    let colonIdx = keyQuoteIdx + ('"' + key + '"').length;
+    while (colonIdx < s.length && ' \t\n\r'.includes(s[colonIdx])) colonIdx++;
+    const valStart = colonIdx + 1;
+    const valEnd = findValueEnd(s, valStart);
+    return s.slice(0, valStart) + valueJson + s.slice(valEnd);
+  } else {
+    const braceIdx = s.indexOf('{');
+    if (braceIdx === -1) return s;
+    return s.slice(0, braceIdx + 1) + '"' + key + '":' + valueJson + ',' + s.slice(braceIdx + 1);
+  }
+}
+
+function rewriteUltraModel(bodyStr) {
+  const modelKeyIdx = findTopLevelKey(bodyStr, 'model');
+  if (modelKeyIdx === -1) return bodyStr;
+  let colonIdx = modelKeyIdx + '"model"'.length;
+  while (colonIdx < bodyStr.length && ' \t\n\r'.includes(bodyStr[colonIdx])) colonIdx++;
+  if (bodyStr[colonIdx] !== ':') return bodyStr;
+  let valStart = colonIdx + 1;
+  while (valStart < bodyStr.length && ' \t\n\r'.includes(bodyStr[valStart])) valStart++;
+  if (bodyStr[valStart] !== '"') return bodyStr;
+  let valEnd = valStart + 1;
+  while (valEnd < bodyStr.length) {
+    if (bodyStr[valEnd] === '\\') { valEnd += 2; continue; }
+    if (bodyStr[valEnd] === '"') break;
+    valEnd++;
+  }
+  const modelVal = bodyStr.slice(valStart + 1, valEnd);
+  if (!modelVal.endsWith('-ultra')) return bodyStr;
+  const spec = ULTRA_MODELS[modelVal];
+  if (spec) {
+    let s = bodyStr;
+    s = s.slice(0, valStart + 1) + spec.model + s.slice(valEnd);
+    if (spec.removeEffort) s = removeTopLevelKey(s, 'effort');
+    s = replaceOrInsertTopLevelKey(s, 'thinking', spec.thinking);
+    if (spec.output_config) s = replaceOrInsertTopLevelKey(s, 'output_config', spec.output_config);
+    console.log(`[ULTRA] ${modelVal} -> ${spec.model} + thinking=${spec.thinking}${spec.output_config ? ' + output_config=' + spec.output_config : ''}`);
+    return s;
+  } else {
+    const baseModel = modelVal.slice(0, -6);
+    const s = bodyStr.slice(0, valStart + 1) + baseModel + bodyStr.slice(valEnd);
+    console.log(`[ULTRA] ${modelVal} -> ${baseModel} (unknown ultra, suffix stripped only)`);
+    return s;
+  }
+}
+
 // ─── Request Processing ─────────────────────────────────────────────────────
 function processBody(bodyStr, config) {
   // Mask thinking/redacted_thinking content blocks from the transform pipeline
@@ -1133,6 +1293,7 @@ function startServer(config) {
 
       let bodyStr = body.toString('utf8');
       const originalSize = bodyStr.length;
+      bodyStr = rewriteUltraModel(bodyStr);
       bodyStr = processBody(bodyStr, config);
       bodyStr = maybeDedupRequestBody(reqNum, bodyStr);
       body = Buffer.from(bodyStr, 'utf8');

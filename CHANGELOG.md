@@ -6,6 +6,10 @@
 
 **Changes:**
 - Added API-key authentication via a keys file of SHA256 key hashes.
+- Added Cangjie-compatible ultra model rewrite support:
+  claude-opus-4-7-ultra, claude-opus-4-6-ultra, and
+  claude-sonnet-4-6-ultra map to their base models with the expected
+  top-level thinking overrides. Unknown *-ultra names strip only the suffix.
 - Added optional request dump, raw upstream dump, request deduplication, and
   response deduplication controls via BILLING_PROXY_* environment variables.
 - Added thinking-block masking around request and response transforms so

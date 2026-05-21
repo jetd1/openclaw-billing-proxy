@@ -153,6 +153,69 @@ function getStainlessHeaders() {
   };
 }
 
+// ─── Client Classification ──────────────────────────────────────────────────
+// Real Claude Code traffic already carries the Claude Code body fingerprint and
+// SDK header profile. Running the OpenClaw disguise pipeline on those requests
+// duplicates native CC tool names (Glob/Grep/Agent/etc.) and corrupts response
+// tool names on the way back. Classify before any body mutation so we can keep
+// native CC payloads on an ultra-only path.
+
+function headerValue(headers, name) {
+  const value = headers[name] ?? headers[name.toLowerCase()];
+  if (Array.isArray(value)) return value.join(',');
+  return typeof value === 'string' ? value : '';
+}
+
+function hasClaudeCodeBodyFingerprint(bodyStr) {
+  return bodyStr.includes('x-anthropic-billing-header:') &&
+    bodyStr.includes('cc_version=') &&
+    bodyStr.includes('cc_entrypoint=cli');
+}
+
+function hasClaudeCodeHeaderProfile(headers) {
+  const ua = headerValue(headers, 'user-agent').toLowerCase();
+  const xApp = headerValue(headers, 'x-app').toLowerCase();
+  const sessionId = headerValue(headers, 'x-claude-code-session-id');
+  const stainlessLang = headerValue(headers, 'x-stainless-lang').toLowerCase();
+  const stainlessRuntime = headerValue(headers, 'x-stainless-runtime').toLowerCase();
+  const stainlessPackage = headerValue(headers, 'x-stainless-package-version');
+
+  const looksLikeClaudeCli = ua.includes('claude-cli/') || ua.includes('claude-code/');
+  const hasClaudeCodeSdkHeader =
+    xApp === 'cli' ||
+    sessionId.length > 0 ||
+    stainlessLang === 'js' ||
+    stainlessRuntime === 'node' ||
+    stainlessPackage.length > 0;
+
+  return looksLikeClaudeCli && hasClaudeCodeSdkHeader;
+}
+
+function classifyClientRequest(req, bodyStr) {
+  const hasBodyFingerprint = hasClaudeCodeBodyFingerprint(bodyStr);
+  const hasHeaderProfile = hasClaudeCodeHeaderProfile(req.headers || {});
+  const mode = hasBodyFingerprint && hasHeaderProfile
+    ? 'claude-code-pass-through'
+    : 'openclaw-disguise';
+  return { mode, realClaudeCode: mode === 'claude-code-pass-through', hasBodyFingerprint, hasHeaderProfile };
+}
+
+function proxyApiKeysFromHeaders(headers) {
+  const xApiKey = headerValue(headers, 'x-api-key').trim();
+  const bearerKey = headerValue(headers, 'authorization').replace(/^Bearer\s+/i, '').trim();
+  return [...new Set([xApiKey, bearerKey].filter(Boolean))];
+}
+
+function isValidProxyApiKey(apiKeys, config) {
+  const candidates = Array.isArray(apiKeys) ? apiKeys : [apiKeys].filter(Boolean);
+  if (candidates.length === 0) return false;
+  const validKeys = loadKeysFile(config.keysFile);
+  return candidates.some((apiKey) => {
+    const keyHash = crypto.createHash("sha256").update(apiKey).digest("hex");
+    return validKeys.some(k => k.key_hash === keyHash);
+  });
+}
+
 // ─── Layer 2: String Trigger Replacements ───────────────────────────────────
 // Applied globally via split/join on the entire request body.
 // IMPORTANT: Use space-free replacements for lowercase 'openclaw' to avoid
@@ -452,6 +515,132 @@ function findMatchingBracket(str, start) {
     else if (c === ']') { d--; if (d === 0) return i; }
   }
   return -1;
+}
+
+function getToolNameFromStub(stub) {
+  try {
+    const parsed = JSON.parse(stub);
+    return typeof parsed.name === 'string' ? parsed.name : '';
+  } catch (_) {
+    const match = stub.match(/"name":"((?:\\.|[^"\\])*)"/);
+    return match ? match[1] : '';
+  }
+}
+
+function getToolNamesFromSection(section) {
+  const names = new Set();
+  const re = /"name":"((?:\\.|[^"\\])*)"/g;
+  let match;
+  while ((match = re.exec(section)) !== null) {
+    names.add(match[1]);
+  }
+  return names;
+}
+
+function injectMissingCCToolStubs(section) {
+  const existing = getToolNamesFromSection(section);
+  const missing = CC_TOOL_STUBS.filter((stub) => {
+    const name = getToolNameFromStub(stub);
+    return name && !existing.has(name);
+  });
+  if (missing.length === 0) return section;
+
+  const insertAt = '"tools":['.length;
+  const rest = section.slice(insertAt);
+  const separator = rest.trimStart().startsWith(']') ? '' : ',';
+  return section.slice(0, insertAt) + missing.join(',') + separator + rest;
+}
+
+function findTopLevelArraySection(s, key) {
+  const keyQuoteIdx = findTopLevelKey(s, key);
+  if (keyQuoteIdx === -1) return null;
+  let colonIdx = keyQuoteIdx + ('"' + key + '"').length;
+  while (colonIdx < s.length && ' \t\n\r'.includes(s[colonIdx])) colonIdx++;
+  if (s[colonIdx] !== ':') return null;
+  let valStart = colonIdx + 1;
+  while (valStart < s.length && ' \t\n\r'.includes(s[valStart])) valStart++;
+  if (s[valStart] !== '[') return null;
+  const valEnd = findMatchingBracket(s, valStart);
+  if (valEnd === -1) return null;
+  return { start: keyQuoteIdx, arrayStart: valStart, end: valEnd };
+}
+
+function getToolNamesFromBody(bodyStr) {
+  const section = findTopLevelArraySection(bodyStr, 'tools');
+  if (!section) return [];
+  return [...getToolNamesFromSection(bodyStr.slice(section.start, section.end + 1))];
+}
+
+function sanitizeToolNamePart(name) {
+  const cleaned = String(name || '').replace(/[^A-Za-z0-9_-]/g, '_');
+  return cleaned || 'tool';
+}
+
+function applyStringReplacements(value, replacements) {
+  let out = String(value || '');
+  for (const [find, replace] of replacements) {
+    out = out.split(find).join(replace);
+  }
+  return out;
+}
+
+function uniqueToolAlias(preferred, source, usedNames) {
+  const sourcePart = sanitizeToolNamePart(source).slice(0, 24);
+  const baseRaw = sanitizeToolNamePart(preferred + '_' + sourcePart);
+  const base = baseRaw.slice(0, 64) || 'tool';
+  let candidate = base;
+  let suffix = 2;
+  while (usedNames.has(candidate)) {
+    const tail = '_' + suffix++;
+    candidate = base.slice(0, Math.max(1, 64 - tail.length)) + tail;
+  }
+  usedNames.add(candidate);
+  return candidate;
+}
+
+function buildScopedToolRenamePlan(bodyStr, config) {
+  const inboundNames = getToolNamesFromBody(bodyStr);
+  const layer2Names = inboundNames.map(name => applyStringReplacements(name, config.replacements));
+  const inbound = new Set(layer2Names);
+  const used = new Set(layer2Names);
+  const renames = [];
+  const reverseRenames = [];
+  const collisions = [];
+
+  for (const [orig, preferred] of config.toolRenames) {
+    if (!inbound.has(orig)) continue;
+    const originalCandidates = inboundNames.filter((name) =>
+      applyStringReplacements(name, config.replacements) === orig);
+    const originalName = originalCandidates.includes(orig)
+      ? orig
+      : (originalCandidates[0] || orig);
+    let outbound = preferred;
+    if (used.has(preferred) && preferred !== orig) {
+      outbound = uniqueToolAlias(preferred, orig, used);
+      collisions.push({ original: orig, preferred, outbound });
+    } else {
+      used.add(outbound);
+    }
+    if (outbound !== orig) {
+      renames.push([orig, outbound]);
+      reverseRenames.push([originalName, outbound]);
+    }
+  }
+
+  return { renames, reverseRenames, collisions, inboundNames };
+}
+
+function buildScopedTransformConfig(bodyStr, config) {
+  const toolRenamePlan = buildScopedToolRenamePlan(bodyStr, config);
+  const reverseMap = config.reverseMap.filter(([sanitized]) =>
+    !toolRenamePlan.reverseRenames.some(([original]) => original === sanitized));
+  return {
+    ...config,
+    toolRenames: toolRenamePlan.renames,
+    toolReverseRenames: toolRenamePlan.reverseRenames,
+    reverseMap,
+    toolRenamePlan
+  };
 }
 
 // ─── Thinking Block Protection ──────────────────────────────────────────────
@@ -769,10 +958,11 @@ function processBody(bodyStr, config) {
           section = section.slice(0, vs) + section.slice(i);
           from = vs + 1;
         }
-        // Inject CC tool stubs
+        // Inject CC tool stubs, but skip stubs whose names already exist in the
+        // request. Native Claude Code clients already send Glob/Grep/Agent/etc.
+        // and Anthropic rejects duplicate tool names before inference.
         if (config.injectCCStubs) {
-          const insertAt = '"tools":['.length;
-          section = section.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + ',' + section.slice(insertAt);
+          section = injectMissingCCToolStubs(section);
         }
         m = m.slice(0, toolsIdx) + section + m.slice(toolsEndIdx + 1);
       }
@@ -781,8 +971,11 @@ function processBody(bodyStr, config) {
     // Inject stubs even without description stripping
     const toolsIdx = m.indexOf('"tools":[');
     if (toolsIdx !== -1) {
-      const insertAt = toolsIdx + '"tools":['.length;
-      m = m.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + ',' + m.slice(insertAt);
+      const toolsEndIdx = findMatchingBracket(m, toolsIdx + '"tools":'.length);
+      if (toolsEndIdx !== -1) {
+        const section = injectMissingCCToolStubs(m.slice(toolsIdx, toolsEndIdx + 1));
+        m = m.slice(0, toolsIdx) + section + m.slice(toolsEndIdx + 1);
+      }
     }
   }
 
@@ -884,7 +1077,8 @@ function reverseMap(text, config) {
   // inner quotes are escaped. Without the escaped variant, renamed arg keys
   // like \"SendMessage\" never get reverted to \"message\" and OpenClaw's tool
   // runtime fails with "message required". (issue #11)
-  for (const [orig, cc] of config.toolRenames) {
+  const toolReverseRenames = config.toolReverseRenames || config.toolRenames;
+  for (const [orig, cc] of toolReverseRenames) {
     r = r.split('"' + cc + '"').join('"' + orig + '"');
     r = r.split('\\"' + cc + '\\"').join('\\"' + orig + '\\"');
   }
@@ -902,7 +1096,8 @@ function reverseMap(text, config) {
 
 function buildReversePatterns(config) {
   const patterns = [];
-  for (const [orig, cc] of config.toolRenames) {
+  const toolReverseRenames = config.toolReverseRenames || config.toolRenames;
+  for (const [orig, cc] of toolReverseRenames) {
     patterns.push(['"' + cc + '"', '"' + orig + '"']);
     patterns.push(['\\"' + cc + '\\"', '\\"' + orig + '\\"']);
   }
@@ -1105,7 +1300,7 @@ function textFromContent(content) {
   }).filter(Boolean).join('\n');
 }
 
-function buildRequestDumpSummary(reqNum, url, originalSize, transformedBody) {
+function buildRequestDumpSummary(reqNum, url, originalSize, transformedBody, clientProfile) {
   const summary = {
     reqNum,
     url,
@@ -1114,6 +1309,13 @@ function buildRequestDumpSummary(reqNum, url, originalSize, transformedBody) {
     bodyBytes: Buffer.byteLength(transformedBody, 'utf8'),
     bodySha256: crypto.createHash('sha256').update(transformedBody).digest('hex')
   };
+  if (clientProfile) {
+    summary.clientMode = clientProfile.mode;
+    summary.clientFingerprint = {
+      claudeCodeBody: clientProfile.hasBodyFingerprint,
+      claudeCodeHeaders: clientProfile.hasHeaderProfile
+    };
+  }
   try {
     const parsed = JSON.parse(transformedBody);
     const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
@@ -1148,7 +1350,7 @@ function buildRequestDumpSummary(reqNum, url, originalSize, transformedBody) {
   return summary;
 }
 
-function maybeDumpRequest(reqNum, req, originalSize, transformedBody) {
+function maybeDumpRequest(reqNum, req, originalSize, transformedBody, clientProfile) {
   if (process.env.BILLING_PROXY_REQUEST_DUMP !== '1') return;
   const dumpDir = process.env.BILLING_PROXY_DUMP_DIR || '/etc/billing-proxy/raw-dumps';
   try {
@@ -1156,7 +1358,7 @@ function maybeDumpRequest(reqNum, req, originalSize, transformedBody) {
     const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
     const prefix = path.join(dumpDir, `${stamp}-req-${reqNum}`);
     fs.writeFileSync(`${prefix}.body.json`, transformedBody, { mode: 0o600 });
-    const summary = buildRequestDumpSummary(reqNum, req.url, originalSize, transformedBody);
+    const summary = buildRequestDumpSummary(reqNum, req.url, originalSize, transformedBody, clientProfile);
     fs.writeFileSync(`${prefix}.summary.json`, JSON.stringify(summary, null, 2), { mode: 0o600 });
     console.log(`[REQUEST-DUMP] #${reqNum} ${prefix}.body.json`);
   } catch (error) {
@@ -1267,11 +1469,8 @@ function startServer(config) {
       return;
     }
 
-    // API key authentication
-    const apiKey = (req.headers["x-api-key"] || "").trim() || (req.headers["authorization"] || "").replace(/^Bearer\s+/i, "").trim();
-    const keyHash = crypto.createHash("sha256").update(apiKey).digest("hex");
-    const validKeys = loadKeysFile(config.keysFile);
-    if (!validKeys.some(k => k.key_hash === keyHash)) {
+    const apiKeys = proxyApiKeysFromHeaders(req.headers);
+    if (!isValidProxyApiKey(apiKeys, config)) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: { type: "authentication_error", message: "invalid x-api-key" } }));
       return;
@@ -1284,6 +1483,10 @@ function startServer(config) {
     req.on('data', c => chunks.push(c));
     req.on('end', () => {
       let body = Buffer.concat(chunks);
+      let bodyStr = body.toString('utf8');
+      const originalSize = bodyStr.length;
+      const clientProfile = classifyClientRequest(req, bodyStr);
+
       let oauth;
       try { oauth = getToken(config.credsPath); } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -1291,13 +1494,23 @@ function startServer(config) {
         return;
       }
 
-      let bodyStr = body.toString('utf8');
-      const originalSize = bodyStr.length;
+      let responseConfig = config;
       bodyStr = rewriteUltraModel(bodyStr);
-      bodyStr = processBody(bodyStr, config);
-      bodyStr = maybeDedupRequestBody(reqNum, bodyStr);
+      if (clientProfile.realClaudeCode) {
+        console.log(`[MODE] #${reqNum} claude-code-pass-through: skipping disguise transforms and response reverse-map`);
+      } else {
+        responseConfig = buildScopedTransformConfig(bodyStr, config);
+        if (responseConfig.toolRenamePlan.collisions.length > 0) {
+          const detail = responseConfig.toolRenamePlan.collisions
+            .map(c => `${c.original}->${c.preferred} using ${c.outbound}`)
+            .join(', ');
+          console.log(`[TOOL-RENAME] #${reqNum} target collision: ${detail}`);
+        }
+        bodyStr = processBody(bodyStr, responseConfig);
+        bodyStr = maybeDedupRequestBody(reqNum, bodyStr);
+      }
       body = Buffer.from(bodyStr, 'utf8');
-      maybeDumpRequest(reqNum, req, originalSize, bodyStr);
+      maybeDumpRequest(reqNum, req, originalSize, bodyStr, clientProfile);
 
       const headers = {};
       for (const [key, value] of Object.entries(req.headers)) {
@@ -1312,10 +1525,14 @@ function startServer(config) {
       headers['accept-encoding'] = 'identity';
       headers['anthropic-version'] = '2023-06-01';
 
-      // Inject Stainless SDK + Claude Code identity headers
-      const ccHeaders = getStainlessHeaders();
-      for (const [k, v] of Object.entries(ccHeaders)) {
-        headers[k] = v;
+      // Inject Stainless SDK + Claude Code identity headers only for disguised
+      // OpenClaw traffic. Native Claude Code clients already sent their own
+      // coherent header profile; preserving it avoids mixing two CC identities.
+      if (!clientProfile.realClaudeCode) {
+        const ccHeaders = getStainlessHeaders();
+        for (const [k, v] of Object.entries(ccHeaders)) {
+          headers[k] = v;
+        }
       }
 
       const existingBeta = headers['anthropic-beta'] || '';
@@ -1340,7 +1557,9 @@ function startServer(config) {
             if (errBody.includes('extra usage')) {
               console.error(`[${ts}] #${reqNum} DETECTION! Body: ${body.length}b`);
             }
-            errBody = reverseMap(errBody, config);
+            if (!clientProfile.realClaudeCode) {
+              errBody = reverseMap(errBody, responseConfig);
+            }
             const nh = { ...upRes.headers };
             delete nh['transfer-encoding']; // avoid conflict with content-length
             nh['content-length'] = Buffer.byteLength(errBody);
@@ -1361,13 +1580,25 @@ function startServer(config) {
           delete sseHeaders['content-length'];      // SSE is streamed, no fixed length
           delete sseHeaders['transfer-encoding'];   // avoid header conflicts
           res.writeHead(status, sseHeaders);
+          if (clientProfile.realClaudeCode) {
+            upRes.on('data', (chunk) => {
+              if (process.env.BILLING_PROXY_RAW_DUMP === '1') {
+                const rawTs = new Date().toISOString();
+                const chunkStr = chunk.toString('utf8');
+                process.stdout.write(`[RAW-UPSTREAM ${rawTs} #${reqNum}] ${JSON.stringify(chunkStr)}\n`);
+              }
+              res.write(chunk);
+            });
+            upRes.on('end', () => res.end());
+            return;
+          }
           // StringDecoder buffers incomplete UTF-8 sequences across TCP chunks
           // so multi-byte chars (中文, emoji) that land on a chunk boundary
           // don't decode as U+FFFD.
           const decoder = new StringDecoder('utf8');
           let pending = '';
           const thinkingBlocks = new Set();
-          const reversePatterns = buildReversePatterns(config);
+          const reversePatterns = buildReversePatterns(responseConfig);
           const fieldBuffers = new Map();
           const responseDedupEnabled = process.env.BILLING_PROXY_RESPONSE_DEDUP === '1';
           const textDedupers = new Map();
@@ -1440,7 +1671,7 @@ function startServer(config) {
 
           const transformEvent = (event) => {
             const dataLine = getSseDataLine(event);
-            if (!dataLine) return reverseMap(event, config);
+            if (!dataLine) return reverseMap(event, responseConfig);
             const dataStr = dataLine.value.trim();
             if (dataStr === '[DONE]') {
               return flushAllFields() + event;
@@ -1450,7 +1681,7 @@ function startServer(config) {
             try {
               payload = JSON.parse(dataStr);
             } catch(e) {
-              return reverseMap(event, config);
+              return reverseMap(event, responseConfig);
             }
 
             const index = typeof payload.index === 'number' ? payload.index : null;
@@ -1460,7 +1691,7 @@ function startServer(config) {
                 thinkingBlocks.add(index);
                 return event;
               }
-              return reverseMap(event, config);
+              return reverseMap(event, responseConfig);
             }
 
             if (payload.type === 'content_block_stop') {
@@ -1469,7 +1700,7 @@ function startServer(config) {
                 return event;
               }
               const flushed = index === null ? '' : flushBlock(index);
-              return flushed + reverseMap(event, config);
+              return flushed + reverseMap(event, responseConfig);
             }
 
             if (index !== null && thinkingBlocks.has(index)) {
@@ -1481,20 +1712,20 @@ function startServer(config) {
                 payload.delta.text = getFieldBuffer(index, 'text').process(payload.delta.text);
                 payload.delta.text = processTextForRepeat(index, payload.delta.text);
                 if (payload.delta.text.length === 0) return '';
-                return reverseMap(replaceSseDataLine(event, JSON.stringify(payload)), config);
+                return reverseMap(replaceSseDataLine(event, JSON.stringify(payload)), responseConfig);
               }
               if (payload.delta.type === 'input_json_delta' && typeof payload.delta.partial_json === 'string') {
                 payload.delta.partial_json = getFieldBuffer(index, 'partial_json').process(payload.delta.partial_json);
                 if (payload.delta.partial_json.length === 0) return '';
-                return reverseMap(replaceSseDataLine(event, JSON.stringify(payload)), config);
+                return reverseMap(replaceSseDataLine(event, JSON.stringify(payload)), responseConfig);
               }
             }
 
             if (payload.type === 'message_stop' || payload.type === 'message_delta') {
-              return flushAllFields() + reverseMap(event, config);
+              return flushAllFields() + reverseMap(event, responseConfig);
             }
 
-            return reverseMap(event, config);
+            return reverseMap(event, responseConfig);
           };
 
           upRes.on('data', (chunk) => {
@@ -1523,6 +1754,12 @@ function startServer(config) {
             res.end();
           });
         } else {
+          if (clientProfile.realClaudeCode) {
+            const nh = { ...upRes.headers };
+            res.writeHead(status, nh);
+            upRes.pipe(res);
+            return;
+          }
           const respChunks = [];
           upRes.on('data', c => respChunks.push(c));
           upRes.on('end', () => {
@@ -1531,7 +1768,7 @@ function startServer(config) {
             // stores these bytes and echoes them on the next turn; Anthropic
             // enforces byte-equality on the latest assistant message.
             const { masked: rMasked, masks: rMasks } = maskThinkingBlocks(respBody);
-            respBody = unmaskThinkingBlocks(reverseMap(rMasked, config), rMasks);
+            respBody = unmaskThinkingBlocks(reverseMap(rMasked, responseConfig), rMasks);
             const nh = { ...upRes.headers };
             delete nh['transfer-encoding']; // avoid conflict with content-length
             nh['content-length'] = Buffer.byteLength(respBody);

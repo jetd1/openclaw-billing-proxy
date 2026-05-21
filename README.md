@@ -10,7 +10,12 @@ After Anthropic revoked subscription billing for third-party tools (April 4, 202
 
 ## How It Works
 
-The proxy performs bidirectional request/response processing to defeat Anthropic's multi-layer detection while preserving OpenClaw semantics:
+The proxy has two request modes:
+
+- **OpenClaw disguise mode** performs bidirectional request/response processing to defeat Anthropic's multi-layer detection while preserving OpenClaw semantics.
+- **Claude Code pass-through mode** detects native Claude Code traffic by its existing billing-header body fingerprint plus Claude Code SDK headers. In that mode the proxy only swaps auth and applies the `*-ultra` model rewrite; it does not inject stubs, rename tools, strip system content, or reverse-map responses.
+
+OpenClaw disguise mode does the following:
 
 **Outbound (request to API):**
 1. **Billing Header** -- Injects an 84-character Claude Code billing identifier into the system prompt
@@ -18,7 +23,7 @@ The proxy performs bidirectional request/response processing to defeat Anthropic
 3. **String Sanitization** -- Replaces 30 trigger phrases (OpenClaw, sessions_*, HEARTBEAT, etc.)
 4. **Tool Name Bypass** -- Renames all 29 OpenClaw tool names to PascalCase Claude Code convention (e.g., `exec` -> `Bash`, `lcm_grep` -> `ContextGrep`) throughout the entire body
 5. **System Template Bypass** -- Strips ~28K of structured config sections and replaces with a ~0.5K natural prose paraphrase
-6. **Tool Description Stripping** -- Removes tool descriptions to reduce fingerprint signal
+6. **Tool Description Stripping** -- Removes tool descriptions to reduce fingerprint signal, injects only missing Claude Code tool stubs, and uses request-scoped tool renames when incoming tools already use a preferred target name
 7. **Property Renaming** -- Renames OC-specific schema properties (e.g., `session_id` -> `thread_id`)
 8. **Ultra Model Rewrite** -- Maps Cangjie-style `*-ultra` aliases to base Anthropic model names with top-level thinking overrides
 9. **Request Guard Rails** -- Optional API-key authentication, request deduplication, and diagnostic request dumps
@@ -192,7 +197,7 @@ See `.env.example` for all available environment variables.
 
 ### API Key Authentication
 
-Client requests must include an API key in either `x-api-key` or `Authorization: Bearer ...`. The proxy stores only SHA256 hashes in a keys file, defaulting to `/etc/billing-proxy/keys.json` or the `KEYS_FILE` environment variable.
+Client requests must include a proxy API key in either `x-api-key` or `Authorization: Bearer ...`. The proxy validates that key locally, strips both client auth headers, and always sends Anthropic the proxy's configured Claude OAuth token. If a native client needs to preserve its own `Authorization` header semantics, send the proxy key via `x-api-key`. The proxy stores only SHA256 hashes in a keys file, defaulting to `/etc/billing-proxy/keys.json` or the `KEYS_FILE` environment variable.
 
 Example `keys.json`:
 

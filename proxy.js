@@ -732,6 +732,25 @@ const ULTRA_MODELS = {
     output_config: null,
     removeEffort: true,
   },
+  'claude-opus-4-8-ultra': {
+    model: 'claude-opus-4-8',
+    thinking: '{"type":"adaptive"}',
+    output_config: '{"effort":"max"}',
+    removeEffort: true,
+  },
+  'claude-fable-5-ultra': {
+    model: 'claude-fable-5',
+    thinking: '{"type":"adaptive"}',
+    output_config: '{"effort":"max"}',
+    removeEffort: true,
+  },
+
+  'claude-sonnet-5-ultra': {
+    model: 'claude-sonnet-5',
+    thinking: '{"type":"adaptive"}',
+    output_config: '{"effort":"max"}',
+    removeEffort: true,
+  },
 };
 
 function findTopLevelKey(s, key) {

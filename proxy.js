@@ -70,6 +70,71 @@ const CC_TOOL_STUBS = [
   '{"name":"TodoRead","description":"Read current task list","input_schema":{"type":"object","properties":{}}}'
 ];
 
+// ─── Route Config (prefix model routing) ────────────────────────────────────
+// Parse a baseUrl like "https://api.example.com:8443/v1" into
+// { scheme, host, port, basePath }. Throws on anything we can't use.
+function parseBaseUrl(baseUrl, prefixName) {
+  const m = /^(https?):\/\/([^/:?#]+)(?::(\d+))?(\/[^?#]*)?/i.exec(String(baseUrl || ''));
+  if (!m) {
+    throw new Error(`route "${prefixName}": baseUrl "${baseUrl}" is not a valid http(s) URL`);
+  }
+  const scheme = m[1].toLowerCase();
+  const host = m[2];
+  const port = m[3] ? parseInt(m[3], 10) : (scheme === 'https' ? 443 : 80);
+  const basePath = m[4] || '';
+  return { scheme, host, port, basePath };
+}
+
+// Validate the user's `routes` object into a Map<prefix, normalizedRoute>.
+// Throws (with the offending prefix in the message) on any structural error.
+// A route with tokenEnv set but the env var currently empty does NOT throw —
+// the token is read per-request (rotation-friendly), so we only warn at startup.
+function validateRoutes(routes) {
+  const out = new Map();
+  if (routes == null) return out;
+  if (typeof routes !== 'object' || Array.isArray(routes)) {
+    throw new Error('routes must be a JSON object of prefix -> route');
+  }
+  for (const [prefix, route] of Object.entries(routes)) {
+    if (!route || typeof route !== 'object') {
+      throw new Error(`route "${prefix}": must be an object`);
+    }
+    if (!route.baseUrl) {
+      throw new Error(`route "${prefix}": missing required field "baseUrl"`);
+    }
+    const { scheme, host, port, basePath } = parseBaseUrl(route.baseUrl, prefix);
+
+    const hasToken = typeof route.token === 'string' && route.token.length > 0;
+    const hasTokenEnv = typeof route.tokenEnv === 'string' && route.tokenEnv.length > 0;
+    if (hasToken && hasTokenEnv) {
+      throw new Error(`route "${prefix}": set either "token" or "tokenEnv", not both`);
+    }
+    if (!hasToken && !hasTokenEnv) {
+      throw new Error(`route "${prefix}": missing auth — set "token" or "tokenEnv"`);
+    }
+
+    const authHeader = typeof route.authHeader === 'string' && route.authHeader.length > 0
+      ? route.authHeader.toLowerCase()
+      : 'authorization';
+
+    if (authHeader !== 'authorization' && !hasToken && !hasTokenEnv) {
+      // unreachable given the check above, kept for clarity
+      throw new Error(`route "${prefix}": authHeader set but no token source`);
+    }
+
+    out.set(prefix, {
+      scheme,
+      host,
+      port,
+      basePath,
+      token: hasToken ? route.token : undefined,
+      tokenEnv: hasTokenEnv ? route.tokenEnv : undefined,
+      authHeader
+    });
+  }
+  return out;
+}
+
 // ─── Billing Fingerprint ────────────────────────────────────────────────────
 // Computes a 3-character SHA256 fingerprint hash matching real CC's
 // computeFingerprint() in utils/fingerprint.ts:
@@ -467,6 +532,26 @@ function loadConfig() {
     console.log(`[PROXY] Note: config.json has ${config.toolRenames.length} toolRenames, merged with ${DEFAULT_TOOL_RENAMES.length} defaults -> ${toolRenames.length} total`);
   }
 
+  // Prefix model routing (additive; absent/empty routes = no-op, current behavior).
+  // Wrap validateRoutes so an invalid route prints a single `[ERROR] route ...`
+  // line and exits, matching the credential-missing path below — instead of an
+  // uncaught stack trace. validateRoutes still throws (so the unit tests in
+  // tests/test-routing.js can assert on its Error); we only catch at this call.
+  let routeMap;
+  try {
+    routeMap = validateRoutes(config.routes);
+  } catch (e) {
+    console.error(`[ERROR] ${e.message}`);
+    process.exit(1);
+  }
+  if (routeMap.size > 0) {
+    for (const [prefix, route] of routeMap) {
+      if (route.tokenEnv && !process.env[route.tokenEnv]) {
+        console.log(`[WARN] route "${prefix}": tokenEnv "${route.tokenEnv}" is unset at startup (will be read per-request)`);
+      }
+    }
+  }
+
   return {
     port: envPort || cliPort || config.port || DEFAULT_PORT,
     keysFile: DEFAULT_KEYS_FILE,
@@ -478,7 +563,8 @@ function loadConfig() {
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
     injectCCStubs: config.injectCCStubs !== false,
-    stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false
+    stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false,
+    routes: routeMap
   };
 }
 
@@ -1479,7 +1565,8 @@ function startServer(config) {
             ccToolStubs: config.injectCCStubs ? CC_TOOL_STUBS.length : 0,
             systemStripEnabled: config.stripSystemConfig,
             descriptionStripEnabled: config.stripToolDescriptions
-          }
+          },
+          routes: config.routes instanceof Map ? [...config.routes.keys()] : []
         }));
       } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -1505,6 +1592,79 @@ function startServer(config) {
       let bodyStr = body.toString('utf8');
       const originalSize = bodyStr.length;
       const clientProfile = classifyClientRequest(req, bodyStr);
+
+      // ── Prefix model routing: pure pass-through to a configured endpoint ──
+      // Checked BEFORE ultra/classify/disguise so a configured prefix is an
+      // explicit override. Strips the prefix from `model`, swaps auth to the
+      // route's token, recomputes content-length, and pipes verbatim. No
+      // disguise, no ultra, no reverse-map, no anthropic/stainless/CC headers.
+      const routeHit = resolveRoute(bodyStr, config);
+      if (routeHit) {
+        try {
+          // Rewrite the model value: "prefix/rest" -> "rest" (one targeted slice).
+          const newBodyStr = bodyStr.slice(0, routeHit.modelStart)
+            + routeHit.outModel
+            + bodyStr.slice(routeHit.modelEnd);
+          const newBody = Buffer.from(newBodyStr, 'utf8');
+
+          // Resolve the token now (per-request so tokenEnv rotation works).
+          let token;
+          if (routeHit.route.tokenEnv) {
+            token = process.env[routeHit.route.tokenEnv];
+            if (!token) throw new Error(`route "${routeHit.prefix}": tokenEnv "${routeHit.route.tokenEnv}" is unset`);
+          } else {
+            token = routeHit.route.token;
+          }
+
+          // Build outbound headers: copy client headers, strip the universal set.
+          const outHeaders = {};
+          for (const [key, value] of Object.entries(req.headers)) {
+            const lk = key.toLowerCase();
+            if (lk === 'host' || lk === 'connection' || lk === 'authorization' ||
+                lk === 'x-api-key' || lk === 'content-length' || lk === 'x-session-affinity') continue;
+            outHeaders[key] = value;
+          }
+          // Inject route auth.
+          if (routeHit.route.authHeader === 'authorization') {
+            outHeaders['authorization'] = `Bearer ${token}`;
+          } else {
+            outHeaders[routeHit.route.authHeader] = token;
+          }
+          outHeaders['content-length'] = newBody.length;
+
+          const ts = new Date().toISOString().substring(11, 19);
+          console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} ROUTE ${routeHit.prefix} -> ${routeHit.route.scheme}://${routeHit.route.host}:${routeHit.route.port}${routeHit.route.basePath} (model=${routeHit.outModel || '<empty>'})`);
+
+          const reqLib = routeHit.route.scheme === 'https' ? https : http;
+          const upstreamPath = routeHit.route.basePath + req.url;
+          const upstream = reqLib.request({
+            hostname: routeHit.route.host,
+            port: routeHit.route.port,
+            path: upstreamPath,
+            method: req.method,
+            headers: outHeaders
+          }, (upRes) => {
+            // Pure pipe: status + headers + body, SSE and JSON alike.
+            res.writeHead(upRes.statusCode, upRes.headers);
+            upRes.pipe(res);
+          });
+          upstream.on('error', (e) => {
+            console.error(`[${ts}] #${reqNum} ROUTE-ERR ${routeHit.prefix}: ${e.message}`);
+            if (!res.headersSent) {
+              res.writeHead(502, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
+            } else {
+              res.end();
+            }
+          });
+          upstream.write(newBody);
+          upstream.end();
+        } catch (e) {
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
+        }
+        return; // prefix path fully handled; do NOT fall through to Anthropic logic
+      }
 
       let oauth;
       try { oauth = getToken(config.credsPath); } catch (e) {
@@ -1830,6 +1990,13 @@ function startServer(config) {
       console.log(`  Billing hash:      dynamic (SHA256 fingerprint)`);
       console.log(`  CC headers:        Stainless SDK + identity`);
       console.log(`  Credentials:       ${config.credsPath}`);
+      if (config.routes instanceof Map && config.routes.size > 0) {
+        console.log(`  Routes:`);
+        for (const [prefix, route] of config.routes) {
+          const auth = route.authHeader === 'authorization' ? 'Bearer' : route.authHeader;
+          console.log(`    ${prefix} -> ${route.scheme}://${route.host}:${route.port}${route.basePath} (${auth})`);
+        }
+      }
       console.log(`\n  Ready. Set openclaw.json baseUrl to http://${bindHost}:${config.port}\n`);
     } catch (e) {
       console.error(`  Started on port ${config.port} but credentials error: ${e.message}`);
@@ -1841,5 +2008,51 @@ function startServer(config) {
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
-const config = loadConfig();
-startServer(config);
+// Guard server startup so tests can require('./proxy.js') for the pure helpers
+// without binding a port. `loadConfig` is side-effectful (it can process.exit
+// on missing credentials), so it only runs when started as the main module.
+function main() {
+  const config = loadConfig();
+  startServer(config);
+}
+
+// ─── Route Resolution ───────────────────────────────────────────────────────
+// Inspect the top-level `model` field via string scanning (no JSON.parse) and,
+// if it is "<prefix>/<rest>" where <prefix> is a configured route, return the
+// matching route + the stripped model name. Otherwise null (fall through to the
+// Anthropic default path). Scans ONLY the top-level model key so model-like
+// strings nested in message history never trigger routing.
+function resolveRoute(bodyStr, config) {
+  const routes = config && config.routes;
+  if (!routes || (routes.size !== undefined ? routes.size === 0 : Object.keys(routes).length === 0)) {
+    return null;
+  }
+  const modelKeyIdx = findTopLevelKey(bodyStr, 'model');
+  if (modelKeyIdx === -1) return null;
+  let colonIdx = modelKeyIdx + '"model"'.length;
+  while (colonIdx < bodyStr.length && ' \t\n\r'.includes(bodyStr[colonIdx])) colonIdx++;
+  if (bodyStr[colonIdx] !== ':') return null;
+  let valStart = colonIdx + 1;
+  while (valStart < bodyStr.length && ' \t\n\r'.includes(bodyStr[valStart])) valStart++;
+  if (bodyStr[valStart] !== '"') return null;
+  let valEnd = valStart + 1;
+  while (valEnd < bodyStr.length) {
+    if (bodyStr[valEnd] === '\\') { valEnd += 2; continue; }
+    if (bodyStr[valEnd] === '"') break;
+    valEnd++;
+  }
+  const modelVal = bodyStr.slice(valStart + 1, valEnd);
+  const slashIdx = modelVal.indexOf('/');
+  if (slashIdx === -1) return null;
+  const prefix = modelVal.slice(0, slashIdx);
+  const outModel = modelVal.slice(slashIdx + 1);
+  const route = routes instanceof Map ? routes.get(prefix) : routes[prefix];
+  if (!route) return null;
+  return { route, prefix, outModel, modelStart: valStart + 1, modelEnd: valEnd };
+}
+
+module.exports = { resolveRoute, main, loadConfig, startServer, validateRoutes, parseBaseUrl };
+
+if (require.main === module) {
+  main();
+}

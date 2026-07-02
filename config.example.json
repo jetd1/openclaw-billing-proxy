@@ -10,5 +10,6 @@
   "_comment_config": "The replacements, reverseMap, toolRenames, and propRenames arrays below show the defaults. You only need config.json if you want to customize them.",
 
   "_comment_toolRenames": "Tool name renames are applied as quoted replacements throughout the entire body. The defaults cover all known OpenClaw tools. Add entries for any custom tools your OpenClaw version adds.",
-  "_comment_propRenames": "Property renames handle OC-specific schema properties. Add entries for any custom properties."
+  "_comment_propRenames": "Property renames handle OC-specific schema properties. Add entries for any custom properties.",
+  "_comment_routes": "Prefix model routing (optional). Add a 'routes' object to forward '<prefix>/<model>' requests to a custom endpoint with pure pass-through. Example: {\"routes\":{\"t9s\":{\"baseUrl\":\"http://t9s-router:8000\",\"tokenEnv\":\"T9S_TOKEN\"},\"endpoint_a\":{\"baseUrl\":\"https://api.example.com/v1\",\"token\":\"sk-...\",\"authHeader\":\"x-api-key\"}}}. Absent/empty = no change to existing behavior."
 }

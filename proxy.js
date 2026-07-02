@@ -533,7 +533,17 @@ function loadConfig() {
   }
 
   // Prefix model routing (additive; absent/empty routes = no-op, current behavior).
-  const routeMap = validateRoutes(config.routes);
+  // Wrap validateRoutes so an invalid route prints a single `[ERROR] route ...`
+  // line and exits, matching the credential-missing path below — instead of an
+  // uncaught stack trace. validateRoutes still throws (so the unit tests in
+  // tests/test-routing.js can assert on its Error); we only catch at this call.
+  let routeMap;
+  try {
+    routeMap = validateRoutes(config.routes);
+  } catch (e) {
+    console.error(`[ERROR] ${e.message}`);
+    process.exit(1);
+  }
   if (routeMap.size > 0) {
     for (const [prefix, route] of routeMap) {
       if (route.tokenEnv && !process.env[route.tokenEnv]) {

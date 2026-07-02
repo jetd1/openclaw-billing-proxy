@@ -265,6 +265,12 @@ an endpoint:
 }
 ```
 
+> **Path concatenation:** the proxy appends the client's full request path to
+> the `baseUrl`'s path verbatim (`basePath + req.url`). Clients send paths like
+> `/v1/messages`, so a `baseUrl` ending in `/v1` makes the upstream see
+> `/v1/v1/messages`. Only include an API-version path in `baseUrl` when the
+> client's own path does not already include it.
+
 | field        | required | default        | meaning |
 |--------------|----------|----------------|---------|
 | `baseUrl`    | yes      | —              | scheme+host(+port)(+basePath) of the upstream |

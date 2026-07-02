@@ -52,8 +52,22 @@ async function waitForHealth(base, ms = 5000) {
   throw new Error('proxy did not become healthy');
 }
 
+// Send SIGTERM and await the child's actual 'exit' event. Awaiting exit (rather
+// than fire-and-forget) guarantees the port is released before the next test
+// binds it, so a stale proxy can't answer a later test's waitForHealth or trip
+// EADDRINUSE. A 3s fallback resolves the promise if exit never fires, so a
+// wedged child can never stall the suite.
 async function kill(child) {
-  if (!child.killed) { child.kill('SIGTERM'); }
+  // Already exited: no 'exit' event will ever fire, so don't wait on it.
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  let timer;
+  const exited = new Promise((resolve) => {
+    timer = setTimeout(resolve, 3000);
+    if (typeof timer.unref === 'function') timer.unref();
+    child.once('exit', () => { clearTimeout(timer); resolve(); });
+  });
+  if (!child.killed) child.kill('SIGTERM');
+  await exited;
 }
 
 test('prefix route: plain JSON pass-through rewrites model and swaps auth', async () => {
@@ -94,6 +108,7 @@ test('prefix route: plain JSON pass-through rewrites model and swaps auth', asyn
   } finally {
     await kill(proxy.child);
     upstream.server.close();
+    fs.rmSync(proxy.dir, { recursive: true, force: true });
   }
 });
 
@@ -119,6 +134,7 @@ test('prefix route: authHeader x-api-key sends bare token', async () => {
   } finally {
     await kill(proxy.child);
     upstream.server.close();
+    fs.rmSync(proxy.dir, { recursive: true, force: true });
   }
 });
 
@@ -153,6 +169,7 @@ test('prefix route: SSE response is piped byte-for-byte', async () => {
   } finally {
     await kill(proxy.child);
     upstream.server.close();
+    fs.rmSync(proxy.dir, { recursive: true, force: true });
   }
 });
 
@@ -176,6 +193,7 @@ test('prefix route: basePath is prepended to the request path', async () => {
   } finally {
     await kill(proxy.child);
     upstream.server.close();
+    fs.rmSync(proxy.dir, { recursive: true, force: true });
   }
 });
 
@@ -203,6 +221,7 @@ test('prefix route: unknown prefix falls through (does not hit upstream stub)', 
   } finally {
     await kill(proxy.child);
     upstream.server.close();
+    fs.rmSync(proxy.dir, { recursive: true, force: true });
   }
 });
 
@@ -256,11 +275,12 @@ test('prefix route: Claude-Code-characteristic request with prefixed model still
   } finally {
     await kill(proxy.child);
     upstream.server.close();
+    fs.rmSync(proxy.dir, { recursive: true, force: true });
   }
 });
 
 test('/health reports configured routes', async () => {
-  const proxyPort = 18816;
+  const proxyPort = 18817;
   const proxy = startProxyOnPort({
     port: proxyPort,
     routes: {
@@ -276,5 +296,6 @@ test('/health reports configured routes', async () => {
     assert.deepStrictEqual(json.routes.sort(), ['endpoint_a', 't9s']);
   } finally {
     await kill(proxy.child);
+    fs.rmSync(proxy.dir, { recursive: true, force: true });
   }
 });

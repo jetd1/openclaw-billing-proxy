@@ -258,3 +258,23 @@ test('prefix route: Claude-Code-characteristic request with prefixed model still
     upstream.server.close();
   }
 });
+
+test('/health reports configured routes', async () => {
+  const proxyPort = 18816;
+  const proxy = startProxyOnPort({
+    port: proxyPort,
+    routes: {
+      t9s: { baseUrl: 'http://127.0.0.1:9999', token: 't9s-secret' },
+      endpoint_a: { baseUrl: 'https://api.example.com/v1', token: 'ea-secret', authHeader: 'x-api-key' }
+    }
+  }, proxyPort, {});
+  try {
+    await waitForHealth(proxy.base);
+    const r = await fetch(proxy.base + '/health');
+    const json = await r.json();
+    assert.ok(Array.isArray(json.routes), 'routes is an array');
+    assert.deepStrictEqual(json.routes.sort(), ['endpoint_a', 't9s']);
+  } finally {
+    await kill(proxy.child);
+  }
+});

@@ -1555,7 +1555,8 @@ function startServer(config) {
             ccToolStubs: config.injectCCStubs ? CC_TOOL_STUBS.length : 0,
             systemStripEnabled: config.stripSystemConfig,
             descriptionStripEnabled: config.stripToolDescriptions
-          }
+          },
+          routes: config.routes instanceof Map ? [...config.routes.keys()] : []
         }));
       } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -1979,6 +1980,13 @@ function startServer(config) {
       console.log(`  Billing hash:      dynamic (SHA256 fingerprint)`);
       console.log(`  CC headers:        Stainless SDK + identity`);
       console.log(`  Credentials:       ${config.credsPath}`);
+      if (config.routes instanceof Map && config.routes.size > 0) {
+        console.log(`  Routes:`);
+        for (const [prefix, route] of config.routes) {
+          const auth = route.authHeader === 'authorization' ? 'Bearer' : route.authHeader;
+          console.log(`    ${prefix} -> ${route.scheme}://${route.host}:${route.port}${route.basePath} (${auth})`);
+        }
+      }
       console.log(`\n  Ready. Set openclaw.json baseUrl to http://${bindHost}:${config.port}\n`);
     } catch (e) {
       console.error(`  Started on port ${config.port} but credentials error: ${e.message}`);

@@ -1582,6 +1582,79 @@ function startServer(config) {
       const originalSize = bodyStr.length;
       const clientProfile = classifyClientRequest(req, bodyStr);
 
+      // ── Prefix model routing: pure pass-through to a configured endpoint ──
+      // Checked BEFORE ultra/classify/disguise so a configured prefix is an
+      // explicit override. Strips the prefix from `model`, swaps auth to the
+      // route's token, recomputes content-length, and pipes verbatim. No
+      // disguise, no ultra, no reverse-map, no anthropic/stainless/CC headers.
+      const routeHit = resolveRoute(bodyStr, config);
+      if (routeHit) {
+        try {
+          // Rewrite the model value: "prefix/rest" -> "rest" (one targeted slice).
+          const newBodyStr = bodyStr.slice(0, routeHit.modelStart)
+            + routeHit.outModel
+            + bodyStr.slice(routeHit.modelEnd);
+          const newBody = Buffer.from(newBodyStr, 'utf8');
+
+          // Resolve the token now (per-request so tokenEnv rotation works).
+          let token;
+          if (routeHit.route.tokenEnv) {
+            token = process.env[routeHit.route.tokenEnv];
+            if (!token) throw new Error(`route "${routeHit.prefix}": tokenEnv "${routeHit.route.tokenEnv}" is unset`);
+          } else {
+            token = routeHit.route.token;
+          }
+
+          // Build outbound headers: copy client headers, strip the universal set.
+          const outHeaders = {};
+          for (const [key, value] of Object.entries(req.headers)) {
+            const lk = key.toLowerCase();
+            if (lk === 'host' || lk === 'connection' || lk === 'authorization' ||
+                lk === 'x-api-key' || lk === 'content-length' || lk === 'x-session-affinity') continue;
+            outHeaders[key] = value;
+          }
+          // Inject route auth.
+          if (routeHit.route.authHeader === 'authorization') {
+            outHeaders['authorization'] = `Bearer ${token}`;
+          } else {
+            outHeaders[routeHit.route.authHeader] = token;
+          }
+          outHeaders['content-length'] = newBody.length;
+
+          const ts = new Date().toISOString().substring(11, 19);
+          console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} ROUTE ${routeHit.prefix} -> ${routeHit.route.scheme}://${routeHit.route.host}:${routeHit.route.port}${routeHit.route.basePath} (model=${routeHit.outModel || '<empty>'})`);
+
+          const reqLib = routeHit.route.scheme === 'https' ? https : http;
+          const upstreamPath = routeHit.route.basePath + req.url;
+          const upstream = reqLib.request({
+            hostname: routeHit.route.host,
+            port: routeHit.route.port,
+            path: upstreamPath,
+            method: req.method,
+            headers: outHeaders
+          }, (upRes) => {
+            // Pure pipe: status + headers + body, SSE and JSON alike.
+            res.writeHead(upRes.statusCode, upRes.headers);
+            upRes.pipe(res);
+          });
+          upstream.on('error', (e) => {
+            console.error(`[${ts}] #${reqNum} ROUTE-ERR ${routeHit.prefix}: ${e.message}`);
+            if (!res.headersSent) {
+              res.writeHead(502, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
+            } else {
+              res.end();
+            }
+          });
+          upstream.write(newBody);
+          upstream.end();
+        } catch (e) {
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
+        }
+        return; // prefix path fully handled; do NOT fall through to Anthropic logic
+      }
+
       let oauth;
       try { oauth = getToken(config.credsPath); } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });

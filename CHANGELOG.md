@@ -1,5 +1,40 @@
 # Changelog
 
+## v2.3.0 -- 2026-07-03
+
+### Prefix model routing to multiple upstream endpoints
+
+**Changes:**
+- Added a `routes` config table that forwards model-prefixed requests
+  (e.g. `t9s/MODEL_A`) to a configured upstream endpoint with pure
+  pass-through. The prefix is stripped from `model`, auth is swapped to the
+  route's token, `content-length` is recomputed, and the response (SSE or
+  plain JSON) is piped verbatim. No disguise, ultra rewrite, reverse-map, or
+  Anthropic/Stainless header injection runs on the prefix path.
+- Route fields: `baseUrl` (required), `token` (literal) or `tokenEnv` (env
+  var, read per-request for rotation), optional `authHeader` (default
+  `authorization` → `Bearer <token>`; any other name sends the bare token).
+- Models with no `/` (or an unknown prefix) fall through to the existing
+  Anthropic disguise path unchanged — additive-only, byte-identical when
+  `routes` is absent or empty.
+- Prefix resolution precedes Claude Code classification, so a Claude Code
+  client can use `t9s/model_a` to reach an alternative endpoint; CC
+  characteristics pass through verbatim and only auth is swapped. The CC
+  OAuth token is never read on the prefix path.
+- `KEYS_FILE` client authentication applies to all routes. `/health` lists
+  configured routes; the startup banner prints a `Routes:` block.
+- Config validation is fail-fast: an invalid route prints
+  `[ERROR] route "<prefix>": <reason>` and exits 1 at startup.
+- Added tests (`tests/test-routing.js`, `tests/test-server.js`) using Node's
+  built-in `node --test` runner. Zero new dependencies.
+
+**Why:**
+Lets a single proxy instance serve alternative backends (e.g. an internal
+t9s LLM gateway) alongside the Anthropic subscription path, with no payload
+translation — "request whatever endpoint, forward to whatever endpoint."
+
+---
+
 ## Unreleased
 
 ### Sync production hardening patches

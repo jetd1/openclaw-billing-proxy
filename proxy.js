@@ -35,7 +35,7 @@ const { StringDecoder } = require('string_decoder');
 const DEFAULT_PORT = 18801;
 const DEFAULT_KEYS_FILE = process.env.KEYS_FILE || "/etc/billing-proxy/keys.json";
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.2.3';
+const VERSION = '2.3.0';
 
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.97';

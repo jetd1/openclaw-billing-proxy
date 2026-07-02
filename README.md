@@ -238,6 +238,55 @@ The proxy recognizes Cangjie-compatible `-ultra` model aliases before the normal
 
 The rewrite scans only the top-level `model` key, so nested history or streamed response content is not used to trigger the override.
 
+### Prefix Model Routing
+
+The proxy can forward requests to additional upstream endpoints based on a
+**model-name prefix**. A request whose `model` is `<prefix>/<rest>` is forwarded
+to the configured `<prefix>` endpoint with the model rewritten to `<rest>`; the
+rest of the request and the full response (SSE or plain JSON) pass through
+byte-for-byte. No payload translation, no disguise, no reverse mapping.
+
+Add a `routes` object to `config.json`. Each key is a prefix; each value names
+an endpoint:
+
+```json
+{
+  "routes": {
+    "t9s": {
+      "baseUrl": "http://t9s-router.internal:8000",
+      "tokenEnv": "T9S_TOKEN"
+    },
+    "endpoint_a": {
+      "baseUrl": "https://api.example.com/v1",
+      "token": "sk-static-literal",
+      "authHeader": "x-api-key"
+    }
+  }
+}
+```
+
+| field        | required | default        | meaning |
+|--------------|----------|----------------|---------|
+| `baseUrl`    | yes      | —              | scheme+host(+port)(+basePath) of the upstream |
+| `token`      | one of   | —              | literal token |
+| `tokenEnv`   | one of   | —              | env var name holding the token (read per-request, supports rotation) |
+| `authHeader` | no       | `authorization`| header for the token. `authorization` sends `Bearer <token>`; any other name sends the bare token |
+
+Routing resolution:
+
+- `model` with no `/` (e.g. `claude-opus-4-8`, or native Claude Code traffic) →
+  Anthropic default path (existing disguise / pass-through), unchanged.
+- `model` with a `/` whose prefix matches a route → prefix pass-through path.
+- `model` with a `/` whose prefix is **not** a route → Anthropic default path.
+- Prefix resolution happens **before** Claude Code classification, so a Claude
+  Code client can use `t9s/model_a` to reach the `t9s` endpoint. The client's
+  Anthropic-specific headers and body blocks pass through verbatim; only the
+  auth header is swapped to the route's token (the Claude Code OAuth token never
+  reaches the alternative endpoint).
+
+The proxy's `KEYS_FILE` client authentication applies to all routes, including
+prefix routes. `curl http://127.0.0.1:18801/health` lists configured routes.
+
 ### Linux (systemd)
 ```bash
 sudo tee /etc/systemd/system/openclaw-proxy.service << EOF

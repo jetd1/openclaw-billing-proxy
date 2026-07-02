@@ -100,3 +100,57 @@ test('validateRoutes: rejects routes that is not an object', () => {
   assert.throws(() => validateRoutes('nope'), /routes.*object/i);
   assert.throws(() => validateRoutes([]), /routes.*object/i);
 });
+
+const ROUTES = new Map([
+  ['t9s', { scheme: 'http', host: 'h', port: 8000, basePath: '', token: 'tok', authHeader: 'authorization' }],
+  ['endpoint_a', { scheme: 'https', host: 'h', port: 443, basePath: '/v1', token: 'tok', authHeader: 'x-api-key' }]
+]);
+
+function bodyWithModel(model) {
+  // A minimal but realistic Messages API body. model is the top-level field.
+  return JSON.stringify({ model, max_tokens: 100, messages: [{ role: 'user', content: 'hi' }] });
+}
+
+test('resolveRoute: prefixed model hits the route', () => {
+  const r = resolveRoute(bodyWithModel('t9s/MODEL_A'), { routes: ROUTES });
+  assert.ok(r, 'should resolve');
+  assert.strictEqual(r.prefix, 't9s');
+  assert.strictEqual(r.outModel, 'MODEL_A');
+  assert.strictEqual(r.route, ROUTES.get('t9s'));
+});
+
+test('resolveRoute: prefix with rest containing slashes keeps full rest', () => {
+  const r = resolveRoute(bodyWithModel('t9s/org/model-a'), { routes: ROUTES });
+  assert.strictEqual(r.outModel, 'org/model-a');
+});
+
+test('resolveRoute: model without slash returns null', () => {
+  assert.strictEqual(resolveRoute(bodyWithModel('claude-opus-4-8'), { routes: ROUTES }), null);
+});
+
+test('resolveRoute: prefix not in routes returns null', () => {
+  assert.strictEqual(resolveRoute(bodyWithModel('unknown/foo'), { routes: ROUTES }), null);
+});
+
+test('resolveRoute: empty config.routes returns null', () => {
+  assert.strictEqual(resolveRoute(bodyWithModel('t9s/MODEL_A'), { routes: new Map() }), null);
+});
+
+test('resolveRoute: trailing slash prefix (t9s/) resolves with empty outModel', () => {
+  const r = resolveRoute(bodyWithModel('t9s/'), { routes: ROUTES });
+  assert.strictEqual(r.prefix, 't9s');
+  assert.strictEqual(r.outModel, '');
+});
+
+test('resolveRoute: model field absent returns null', () => {
+  assert.strictEqual(resolveRoute('{"max_tokens":1,"messages":[]}', { routes: ROUTES }), null);
+});
+
+test('resolveRoute: does not match model name nested in messages history', () => {
+  // A model-like string inside message content must NOT trigger routing.
+  const body = JSON.stringify({
+    model: 'claude-opus-4-8',
+    messages: [{ role: 'user', content: 'please use t9s/MODEL_A for this' }]
+  });
+  assert.strictEqual(resolveRoute(body, { routes: ROUTES }), null);
+});

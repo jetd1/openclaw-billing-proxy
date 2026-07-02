@@ -1925,9 +1925,39 @@ function main() {
   startServer(config);
 }
 
-// Stub: implemented in Task 3. Exported now so the test harness can wire up.
-function resolveRoute(_bodyStr, _config) {
-  return null;
+// ─── Route Resolution ───────────────────────────────────────────────────────
+// Inspect the top-level `model` field via string scanning (no JSON.parse) and,
+// if it is "<prefix>/<rest>" where <prefix> is a configured route, return the
+// matching route + the stripped model name. Otherwise null (fall through to the
+// Anthropic default path). Scans ONLY the top-level model key so model-like
+// strings nested in message history never trigger routing.
+function resolveRoute(bodyStr, config) {
+  const routes = config && config.routes;
+  if (!routes || (routes.size !== undefined ? routes.size === 0 : Object.keys(routes).length === 0)) {
+    return null;
+  }
+  const modelKeyIdx = findTopLevelKey(bodyStr, 'model');
+  if (modelKeyIdx === -1) return null;
+  let colonIdx = modelKeyIdx + '"model"'.length;
+  while (colonIdx < bodyStr.length && ' \t\n\r'.includes(bodyStr[colonIdx])) colonIdx++;
+  if (bodyStr[colonIdx] !== ':') return null;
+  let valStart = colonIdx + 1;
+  while (valStart < bodyStr.length && ' \t\n\r'.includes(bodyStr[valStart])) valStart++;
+  if (bodyStr[valStart] !== '"') return null;
+  let valEnd = valStart + 1;
+  while (valEnd < bodyStr.length) {
+    if (bodyStr[valEnd] === '\\') { valEnd += 2; continue; }
+    if (bodyStr[valEnd] === '"') break;
+    valEnd++;
+  }
+  const modelVal = bodyStr.slice(valStart + 1, valEnd);
+  const slashIdx = modelVal.indexOf('/');
+  if (slashIdx === -1) return null;
+  const prefix = modelVal.slice(0, slashIdx);
+  const outModel = modelVal.slice(slashIdx + 1);
+  const route = routes instanceof Map ? routes.get(prefix) : routes[prefix];
+  if (!route) return null;
+  return { route, prefix, outModel, modelStart: valStart + 1, modelEnd: valEnd };
 }
 
 module.exports = { resolveRoute, main, loadConfig, startServer, validateRoutes, parseBaseUrl };

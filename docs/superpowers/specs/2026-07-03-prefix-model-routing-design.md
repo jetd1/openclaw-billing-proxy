@@ -82,9 +82,20 @@ Edge cases (all explicit, no surprises):
 - Model with `/` but prefix not in `routes` → `null` → Anthropic default.
 - `t9s/` (rest empty) → route hit, model rewritten to empty string; upstream
   rejects. No special handling — pass-through is literal.
-- Native Claude Code traffic whose model happens to carry a configured prefix →
-  prefix route wins (prefix is checked before classification). This is
-  intentional and documented: a configured prefix is an explicit override.
+- **Native Claude Code traffic whose model carries a configured prefix** (e.g.
+  real CC body fingerprint + stainless headers + `model: "t9s/model_a"`) →
+  **prefix route wins**. `resolveRoute` runs before `classifyClientRequest`, so
+  this request goes to the `t9s` endpoint, not Anthropic. This is intentional:
+  a configured prefix is an explicit override that lets a CC client reach
+  alternative backends. On the prefix path the CC characteristics — the body's
+  `x-anthropic-billing-header` text block, `anthropic-version`, `anthropic-beta`
+  (incl. `claude-code-20250219`), `stainless-*`, `x-app`, `x-claude-code-session-id`
+  — are **passed through verbatim** to the upstream. They are NOT stripped. The
+  upstream ignores unknown headers and the billing text block is inert; this
+  follows the pure pass-through principle ("完全透传，不做任何理解"). Only the
+  universal strip set (`host`/`connection`/`authorization`/`x-api-key`/
+  `content-length`/`x-session-affinity`) is removed, and `authorization` is
+  replaced with the route's token — so the CC OAuth token never leaks upstream.
 
 ### Prefix pass-through path
 

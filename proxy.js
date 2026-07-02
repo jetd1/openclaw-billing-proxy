@@ -70,6 +70,71 @@ const CC_TOOL_STUBS = [
   '{"name":"TodoRead","description":"Read current task list","input_schema":{"type":"object","properties":{}}}'
 ];
 
+// ─── Route Config (prefix model routing) ────────────────────────────────────
+// Parse a baseUrl like "https://api.example.com:8443/v1" into
+// { scheme, host, port, basePath }. Throws on anything we can't use.
+function parseBaseUrl(baseUrl, prefixName) {
+  const m = /^(https?):\/\/([^/:?#]+)(?::(\d+))?(\/[^?#]*)?/i.exec(String(baseUrl || ''));
+  if (!m) {
+    throw new Error(`route "${prefixName}": baseUrl "${baseUrl}" is not a valid http(s) URL`);
+  }
+  const scheme = m[1].toLowerCase();
+  const host = m[2];
+  const port = m[3] ? parseInt(m[3], 10) : (scheme === 'https' ? 443 : 80);
+  const basePath = m[4] || '';
+  return { scheme, host, port, basePath };
+}
+
+// Validate the user's `routes` object into a Map<prefix, normalizedRoute>.
+// Throws (with the offending prefix in the message) on any structural error.
+// A route with tokenEnv set but the env var currently empty does NOT throw —
+// the token is read per-request (rotation-friendly), so we only warn at startup.
+function validateRoutes(routes) {
+  const out = new Map();
+  if (routes == null) return out;
+  if (typeof routes !== 'object' || Array.isArray(routes)) {
+    throw new Error('routes must be a JSON object of prefix -> route');
+  }
+  for (const [prefix, route] of Object.entries(routes)) {
+    if (!route || typeof route !== 'object') {
+      throw new Error(`route "${prefix}": must be an object`);
+    }
+    if (!route.baseUrl) {
+      throw new Error(`route "${prefix}": missing required field "baseUrl"`);
+    }
+    const { scheme, host, port, basePath } = parseBaseUrl(route.baseUrl, prefix);
+
+    const hasToken = typeof route.token === 'string' && route.token.length > 0;
+    const hasTokenEnv = typeof route.tokenEnv === 'string' && route.tokenEnv.length > 0;
+    if (hasToken && hasTokenEnv) {
+      throw new Error(`route "${prefix}": set either "token" or "tokenEnv", not both`);
+    }
+    if (!hasToken && !hasTokenEnv) {
+      throw new Error(`route "${prefix}": missing auth — set "token" or "tokenEnv"`);
+    }
+
+    const authHeader = typeof route.authHeader === 'string' && route.authHeader.length > 0
+      ? route.authHeader.toLowerCase()
+      : 'authorization';
+
+    if (authHeader !== 'authorization' && !hasToken && !hasTokenEnv) {
+      // unreachable given the check above, kept for clarity
+      throw new Error(`route "${prefix}": authHeader set but no token source`);
+    }
+
+    out.set(prefix, {
+      scheme,
+      host,
+      port,
+      basePath,
+      token: hasToken ? route.token : undefined,
+      tokenEnv: hasTokenEnv ? route.tokenEnv : undefined,
+      authHeader
+    });
+  }
+  return out;
+}
+
 // ─── Billing Fingerprint ────────────────────────────────────────────────────
 // Computes a 3-character SHA256 fingerprint hash matching real CC's
 // computeFingerprint() in utils/fingerprint.ts:
@@ -467,6 +532,16 @@ function loadConfig() {
     console.log(`[PROXY] Note: config.json has ${config.toolRenames.length} toolRenames, merged with ${DEFAULT_TOOL_RENAMES.length} defaults -> ${toolRenames.length} total`);
   }
 
+  // Prefix model routing (additive; absent/empty routes = no-op, current behavior).
+  const routeMap = validateRoutes(config.routes);
+  if (routeMap.size > 0) {
+    for (const [prefix, route] of routeMap) {
+      if (route.tokenEnv && !process.env[route.tokenEnv]) {
+        console.log(`[WARN] route "${prefix}": tokenEnv "${route.tokenEnv}" is unset at startup (will be read per-request)`);
+      }
+    }
+  }
+
   return {
     port: envPort || cliPort || config.port || DEFAULT_PORT,
     keysFile: DEFAULT_KEYS_FILE,
@@ -478,7 +553,8 @@ function loadConfig() {
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
     injectCCStubs: config.injectCCStubs !== false,
-    stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false
+    stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false,
+    routes: routeMap
   };
 }
 
@@ -1854,7 +1930,7 @@ function resolveRoute(_bodyStr, _config) {
   return null;
 }
 
-module.exports = { resolveRoute, main, loadConfig, startServer };
+module.exports = { resolveRoute, main, loadConfig, startServer, validateRoutes, parseBaseUrl };
 
 if (require.main === module) {
   main();

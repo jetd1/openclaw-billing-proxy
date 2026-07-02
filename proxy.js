@@ -1841,5 +1841,21 @@ function startServer(config) {
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
-const config = loadConfig();
-startServer(config);
+// Guard server startup so tests can require('./proxy.js') for the pure helpers
+// without binding a port. `loadConfig` is side-effectful (it can process.exit
+// on missing credentials), so it only runs when started as the main module.
+function main() {
+  const config = loadConfig();
+  startServer(config);
+}
+
+// Stub: implemented in Task 3. Exported now so the test harness can wire up.
+function resolveRoute(_bodyStr, _config) {
+  return null;
+}
+
+module.exports = { resolveRoute, main, loadConfig, startServer };
+
+if (require.main === module) {
+  main();
+}

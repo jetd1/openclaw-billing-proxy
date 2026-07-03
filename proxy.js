@@ -1694,14 +1694,22 @@ function startServer(config) {
       const headers = {};
       for (const [key, value] of Object.entries(req.headers)) {
         const lk = key.toLowerCase();
+        // Strip non-CC headers AND proxy-chain headers. x-forwarded-* / via /
+        // x-real-ip are added by reverse proxies (nginx/caddy) in front of this
+        // proxy; real Claude Code never sends them, so forwarding them upstream
+        // is a transport-layer fingerprint that the traffic was relayed.
         if (lk === 'host' || lk === 'connection' || lk === 'authorization' ||
             lk === 'x-api-key' || lk === 'content-length' ||
-            lk === 'x-session-affinity') continue; // strip non-CC headers
+            lk === 'x-session-affinity' ||
+            lk === 'x-forwarded-for' || lk === 'x-forwarded-proto' ||
+            lk === 'x-forwarded-host' || lk === 'x-forwarded-port' ||
+            lk === 'x-forwarded-server' || lk === 'x-real-ip' || lk === 'via' ||
+            lk === 'x-client-ip' || lk === 'x-cluster-client-ip' ||
+            lk === 'forwarded') continue;
         headers[key] = value;
       }
       headers['authorization'] = `Bearer ${oauth.accessToken}`;
       headers['content-length'] = body.length;
-      headers['accept-encoding'] = 'identity';
       headers['anthropic-version'] = '2023-06-01';
 
       // Inject Stainless SDK + Claude Code identity headers only for disguised
@@ -1712,6 +1720,12 @@ function startServer(config) {
         for (const [k, v] of Object.entries(ccHeaders)) {
           headers[k] = v;
         }
+        // Disguise path parses the SSE response (reverseMap etc.), so it needs
+        // an uncompressed upstream response. Pass-through pipes the response
+        // verbatim and must NOT override the client's accept-encoding — real
+        // Claude Code sends "gzip, deflate, br, zstd", and forcing "identity"
+        // only on pass-through would be a transport fingerprint.
+        headers['accept-encoding'] = 'identity';
       }
 
       const existingBeta = headers['anthropic-beta'] || '';

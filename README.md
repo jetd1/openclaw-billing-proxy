@@ -368,6 +368,25 @@ The fix: strip the entire config section (~28K) and replace with a ~0.5K natural
 ### Detection is cumulative
 The classifier scores the **entire request body** (system + tools + messages), not just the system prompt. Each signal source contributes to an overall score. This means all four layers must be addressed simultaneously for large conversation bodies.
 
+### Disabling layers for performance
+
+Layers 4 (system strip) and 5 (tool description stripping) scan and rewrite large portions of every request body — they are the CPU hot spots on big disguise-path conversations (multi-MB bodies). When Anthropic's enforcement is lax, you can disable them to cut CPU cost with no functional change to OpenClaw.
+
+These are existing config.json switches (default `true`):
+
+```json
+{
+  "stripSystemConfig": false,
+  "stripToolDescriptions": false
+}
+```
+
+`injectCCStubs` (Layer 5's companion — injects minimal Glob/Grep/Agent/NotebookEdit/TodoRead tool stubs) stays `true`; it's cheap and keeps the tool set looking like a Claude Code session.
+
+What still runs with Layers 4/5 off: Layer 1 (billing header injection — required for subscription billing), Layer 2 (string trigger sanitization), Layer 3 (tool name renames), Layer 6 (property renames), and the full response reverse-map. The disguise path remains functional, just with less body rewriting.
+
+Detection enforcement varies over time. If you see `[ts] #N DETECTION!` log lines or `400 ... out of extra usage` responses after disabling, re-enable the layers (delete the two lines or set them `true`) and restart. The switches are read at startup.
+
 ## Why Reverse Mapping Matters
 
 Without reverse mapping, the model sees sanitized paths in its context (e.g., `.ocplatform/workspace/scripts/`) and uses them for tool calls. But the actual filesystem has `.openclaw/`. The reverse mapping translates API responses back to original terms before OpenClaw processes them, ensuring:

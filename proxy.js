@@ -29,12 +29,18 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const zlib = require('zlib');
 const { StringDecoder } = require('string_decoder');
 
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const DEFAULT_KEYS_FILE = process.env.KEYS_FILE || "/etc/billing-proxy/keys.json";
-const UPSTREAM_HOST = 'api.anthropic.com';
+// Upstream Anthropic target. Env-overridable so tests can point the disguise
+// path at a local stub upstream (the disguise path otherwise hardcodes
+// api.anthropic.com and is untestable end-to-end). Defaults preserve production.
+const UPSTREAM_HOST = process.env.UPSTREAM_HOST || 'api.anthropic.com';
+const UPSTREAM_PORT = process.env.UPSTREAM_PORT ? parseInt(process.env.UPSTREAM_PORT, 10) : 443;
+const UPSTREAM_SCHEME = process.env.UPSTREAM_SCHEME || 'https';
 const VERSION = '2.3.0';
 
 // Claude Code version to emulate (update when new CC versions are released)
@@ -216,6 +222,59 @@ function getStainlessHeaders() {
     'x-stainless-timeout': '600',
     'anthropic-dangerous-direct-browser-access': 'true'
   };
+}
+
+// ─── Upstream Response Decompression ────────────────────────────────────────
+// The disguise path advertises accept-encoding: gzip, deflate, br, zstd upstream
+// (matching real Claude Code) instead of identity. Anthropic then returns a
+// compressed response, which the disguise transform (reverseMap / dedup /
+// thinking-block masking) cannot operate on. These helpers classify the upstream
+// content-encoding and decompress before the transform runs. The client still
+// receives identity (uncompressed) — only the proxy<->Anthropic leg is compressed.
+
+// Classify an upstream content-encoding for decompression. Returns one of:
+// 'identity' | 'gzip' | 'deflate' | 'br' | 'zstd' | 'unsupported'.
+// 'identity' covers an absent header, "identity", or empty (plaintext, no work).
+// 'unsupported' (e.g. zstd on Node <22, or any unknown/chained value) => the
+// caller passes raw bytes through with content-encoding preserved and skips the
+// transform. Anthropic sends a single value; we do not split on commas, so a
+// chained value (e.g. "gzip, deflate") classifies as 'unsupported'.
+function decompressionMode(contentEncoding) {
+  if (!contentEncoding) return 'identity';
+  const enc = contentEncoding.toLowerCase().trim();
+  if (enc === '' || enc === 'identity') return 'identity';
+  if (enc === 'gzip' || enc === 'deflate' || enc === 'br') return enc;
+  if (enc === 'zstd' && typeof zlib.createZstdDecompress === 'function') return 'zstd';
+  return 'unsupported';
+}
+
+// Streaming decompressor for the SSE branch. Returns a Transform stream, or null
+// for identity/unsupported (the caller handles those without a pipe).
+function createDecompressor(mode) {
+  switch (mode) {
+    case 'gzip':    return zlib.createGunzip();
+    case 'deflate': return zlib.createInflate();
+    case 'br':      return zlib.createBrotliDecompress();
+    case 'zstd':    return zlib.createZstdDecompress();
+    default:        return null;
+  }
+}
+
+// One-shot decompression for buffered responses (error + non-SSE). Throws on
+// corrupt/truncated input; callers catch and fall back to forwarding raw bytes.
+function decompressBuffer(buf, mode) {
+  switch (mode) {
+    case 'gzip':    return zlib.gunzipSync(buf);
+    case 'br':      return zlib.brotliDecompressSync(buf);
+    case 'zstd':    return zlib.zstdDecompressSync(buf);
+    case 'deflate': {
+      // HTTP "deflate" is ambiguous: RFC 1950 (zlib-wrapped) vs RFC 1951 (raw).
+      // Try wrapped first, fall back to raw.
+      try { return zlib.inflateSync(buf); }
+      catch (_) { return zlib.inflateRawSync(buf); }
+    }
+    default:        return buf; // identity
+  }
 }
 
 // ─── Client Classification ──────────────────────────────────────────────────
@@ -1720,12 +1779,13 @@ function startServer(config) {
         for (const [k, v] of Object.entries(ccHeaders)) {
           headers[k] = v;
         }
-        // Disguise path parses the SSE response (reverseMap etc.), so it needs
-        // an uncompressed upstream response. Pass-through pipes the response
-        // verbatim and must NOT override the client's accept-encoding — real
-        // Claude Code sends "gzip, deflate, br, zstd", and forcing "identity"
-        // only on pass-through would be a transport fingerprint.
-        headers['accept-encoding'] = 'identity';
+        // Advertise the same accept-encoding real Claude Code sends, so the
+        // upstream leg doesn't fingerprint as a relay. The disguise transform
+        // (reverseMap / dedup / thinking-block masking) needs plaintext, so the
+        // response branch decompresses (zlib) before transforming — the client
+        // still receives identity. Pass-through pipes verbatim and keeps the
+        // client's own accept-encoding (preserved by the header-copy loop above).
+        headers['accept-encoding'] = 'gzip, deflate, br, zstd';
       }
 
       const existingBeta = headers['anthropic-beta'] || '';
@@ -1736,8 +1796,8 @@ function startServer(config) {
       const ts = new Date().toISOString().substring(11, 19);
       console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} (${originalSize}b -> ${body.length}b)`);
 
-      const upstream = https.request({
-        hostname: UPSTREAM_HOST, port: 443,
+      const upstream = (UPSTREAM_SCHEME === 'https' ? https : http).request({
+        hostname: UPSTREAM_HOST, port: UPSTREAM_PORT,
         path: req.url, method: req.method, headers
       }, (upRes) => {
         const status = upRes.statusCode;
@@ -1746,15 +1806,44 @@ function startServer(config) {
           const errChunks = [];
           upRes.on('data', c => errChunks.push(c));
           upRes.on('end', () => {
-            let errBody = Buffer.concat(errChunks).toString();
+            const raw = Buffer.concat(errChunks);
+            const nh = { ...upRes.headers };
+            delete nh['transfer-encoding'];
+            if (!clientProfile.realClaudeCode) {
+              const dmode = decompressionMode(upRes.headers['content-encoding']);
+              if (dmode === 'unsupported') {
+                console.warn(`[${ts}] #${reqNum} unsupported content-encoding "${upRes.headers['content-encoding']}" on error response; passing through without disguise transform`);
+                nh['content-length'] = raw.length;
+                res.writeHead(status, nh);
+                res.end(raw);
+                return;
+              }
+              let decoded;
+              try {
+                decoded = dmode === 'identity' ? raw : decompressBuffer(raw, dmode);
+              } catch (e) {
+                console.error(`[${ts}] #${reqNum} error-response decompression failed: ${e.message}; passing through raw`);
+                nh['content-length'] = raw.length;
+                res.writeHead(status, nh);
+                res.end(raw);
+                return;
+              }
+              let errBody = decoded.toString('utf8');
+              if (errBody.includes('extra usage')) {
+                console.error(`[${ts}] #${reqNum} DETECTION! Body: ${body.length}b`);
+              }
+              errBody = reverseMap(errBody, responseConfig);
+              delete nh['content-encoding'];
+              nh['content-length'] = Buffer.byteLength(errBody);
+              res.writeHead(status, nh);
+              res.end(errBody);
+              return;
+            }
+            // Pass-through (unchanged): forward bytes as-is, content-encoding preserved.
+            let errBody = raw.toString();
             if (errBody.includes('extra usage')) {
               console.error(`[${ts}] #${reqNum} DETECTION! Body: ${body.length}b`);
             }
-            if (!clientProfile.realClaudeCode) {
-              errBody = reverseMap(errBody, responseConfig);
-            }
-            const nh = { ...upRes.headers };
-            delete nh['transfer-encoding']; // avoid conflict with content-length
             nh['content-length'] = Buffer.byteLength(errBody);
             res.writeHead(status, nh);
             res.end(errBody);
@@ -1772,8 +1861,9 @@ function startServer(config) {
           const sseHeaders = { ...upRes.headers };
           delete sseHeaders['content-length'];      // SSE is streamed, no fixed length
           delete sseHeaders['transfer-encoding'];   // avoid header conflicts
-          res.writeHead(status, sseHeaders);
           if (clientProfile.realClaudeCode) {
+            // Pass-through: preserve content-encoding; the client decodes.
+            res.writeHead(status, sseHeaders);
             upRes.on('data', (chunk) => {
               if (process.env.BILLING_PROXY_RAW_DUMP === '1') {
                 const rawTs = new Date().toISOString();
@@ -1784,6 +1874,22 @@ function startServer(config) {
             });
             upRes.on('end', () => res.end());
             return;
+          }
+          // Disguise: the transform operates on plaintext SSE, so decompress the
+          // upstream stream before the existing StringDecoder + pending reassembly.
+          // The client receives identity (content-encoding stripped below).
+          const dmode = decompressionMode(upRes.headers['content-encoding']);
+          if (dmode === 'unsupported') {
+            console.warn(`[${ts}] #${reqNum} unsupported content-encoding "${upRes.headers['content-encoding']}" on SSE; passing through without disguise transform`);
+            res.writeHead(status, sseHeaders); // content-encoding preserved
+            upRes.pipe(res);
+            return;
+          }
+          delete sseHeaders['content-encoding'];
+          res.writeHead(status, sseHeaders);
+          let bodyStream = upRes;
+          if (dmode !== 'identity') {
+            bodyStream = upRes.pipe(createDecompressor(dmode));
           }
           // StringDecoder buffers incomplete UTF-8 sequences across TCP chunks
           // so multi-byte chars (中文, emoji) that land on a chunk boundary
@@ -1921,12 +2027,12 @@ function startServer(config) {
             return reverseMap(event, responseConfig);
           };
 
-          upRes.on('data', (chunk) => {
-            // Raw upstream dump for Bug #2 investigation (2026-05-13)
+          bodyStream.on('data', (chunk) => {
+            // Raw dump of the (decompressed) upstream plaintext for debugging.
             if (process.env.BILLING_PROXY_RAW_DUMP === '1') {
-              const ts = new Date().toISOString();
+              const rawTs = new Date().toISOString();
               const chunkStr = chunk.toString('utf8');
-              process.stdout.write(`[RAW-UPSTREAM ${ts} #${reqNum}] ${JSON.stringify(chunkStr)}\n`);
+              process.stdout.write(`[RAW-UPSTREAM ${rawTs} #${reqNum}] ${JSON.stringify(chunkStr)}\n`);
             }
             pending += decoder.write(chunk);
             let sepIdx;
@@ -1936,7 +2042,7 @@ function startServer(config) {
               res.write(transformEvent(event));
             }
           });
-          upRes.on('end', () => {
+          bodyStream.on('end', () => {
             pending += decoder.end();
             if (pending.length > 0) {
               // Trailing bytes with no terminator — shouldn't happen in
@@ -1945,6 +2051,13 @@ function startServer(config) {
             }
             res.write(flushAllFields());
             res.end();
+          });
+          bodyStream.on('error', (e) => {
+            // Decompression or stream error mid-SSE: headers were already sent
+            // as identity and the body is partially written, so destroy is the
+            // only sane recovery (the client sees a truncated identity stream).
+            console.error(`[${ts}] #${reqNum} SSE decompression/stream error: ${e.message}`);
+            if (!res.writableEnded) res.destroy();
           });
         } else {
           if (clientProfile.realClaudeCode) {
@@ -1956,13 +2069,36 @@ function startServer(config) {
           const respChunks = [];
           upRes.on('data', c => respChunks.push(c));
           upRes.on('end', () => {
-            let respBody = Buffer.concat(respChunks).toString();
+            let buf = Buffer.concat(respChunks);
+            const nh = { ...upRes.headers };
+            const dmode = decompressionMode(upRes.headers['content-encoding']);
+            if (dmode === 'unsupported') {
+              console.warn(`[${ts}] #${reqNum} unsupported content-encoding "${upRes.headers['content-encoding']}" on non-SSE; passing through without disguise transform`);
+              delete nh['transfer-encoding'];
+              nh['content-length'] = buf.length;
+              res.writeHead(status, nh);
+              res.end(buf);
+              return;
+            }
+            if (dmode !== 'identity') {
+              try { buf = decompressBuffer(buf, dmode); }
+              catch (e) {
+                console.error(`[${ts}] #${reqNum} non-SSE decompression failed: ${e.message}; passing through raw`);
+                const rawNh = { ...upRes.headers };
+                delete rawNh['transfer-encoding'];
+                rawNh['content-length'] = buf.length;
+                res.writeHead(status, rawNh);
+                res.end(buf);
+                return;
+              }
+            }
+            let respBody = buf.toString('utf8');
             // Mask thinking blocks so reverseMap can't mutate them. The client
             // stores these bytes and echoes them on the next turn; Anthropic
             // enforces byte-equality on the latest assistant message.
             const { masked: rMasked, masks: rMasks } = maskThinkingBlocks(respBody);
             respBody = unmaskThinkingBlocks(reverseMap(rMasked, responseConfig), rMasks);
-            const nh = { ...upRes.headers };
+            delete nh['content-encoding'];
             delete nh['transfer-encoding']; // avoid conflict with content-length
             nh['content-length'] = Buffer.byteLength(respBody);
             res.writeHead(status, nh);
@@ -2065,7 +2201,7 @@ function resolveRoute(bodyStr, config) {
   return { route, prefix, outModel, modelStart: valStart + 1, modelEnd: valEnd };
 }
 
-module.exports = { resolveRoute, main, loadConfig, startServer, validateRoutes, parseBaseUrl };
+module.exports = { resolveRoute, main, loadConfig, startServer, validateRoutes, parseBaseUrl, decompressionMode, createDecompressor, decompressBuffer };
 
 if (require.main === module) {
   main();

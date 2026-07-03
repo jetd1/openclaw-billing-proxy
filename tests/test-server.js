@@ -141,7 +141,7 @@ test('prefix route: authHeader x-api-key sends bare token', async () => {
 test('prefix route: SSE response is piped byte-for-byte', async () => {
   const sseChunks = [
     'event: message_start\ndata: {"type":"message_start"}\n\n',
-    'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}\n\n',
+    'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"pong"}}\n\n',
     'event: message_stop\ndata: {"type":"message_stop"}\n\n'
   ];
   const upstream = createStubUpstream({
@@ -297,5 +297,223 @@ test('/health reports configured routes', async () => {
   } finally {
     await kill(proxy.child);
     fs.rmSync(proxy.dir, { recursive: true, force: true });
+  }
+});
+
+// ─── Disguise path: upstream response decompression (gzip/br/zstd/identity) ─
+// These tests point the disguise path at a local stub upstream by overriding
+// UPSTREAM_HOST/PORT/SCHEME, so the disguise transform runs against a
+// controllable compressed response. Requests are crafted to classify as
+// openclaw-disguise (no CC body fingerprint, no CC headers, no route prefix).
+
+const zlib = require('zlib');
+
+// A disguise-classified request body: no x-anthropic-billing-header, model has
+// no route prefix. stream:true for SSE tests.
+function disguiseBody(stream) {
+  // Include an OpenClaw tool named "exec" so buildScopedToolRenamePlan establishes
+  // the exec<->Bash rename; otherwise reverseMap has no mapping to apply to the
+  // response (the real disguise body always carries the tool set).
+  const b = {
+    model: 'claude-sonnet-4-5-20250929', max_tokens: 16,
+    tools: [{ name: 'exec', description: 'run a shell command', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } }],
+    messages: [{ role: 'user', content: 'hi' }]
+  };
+  if (stream) b.stream = true;
+  return JSON.stringify(b);
+}
+
+async function startStubAndProxy(stubOpts, proxyPort) {
+  const upstream = createStubUpstream(stubOpts);
+  await new Promise((res) => upstream.server.listen(0, '127.0.0.1', res));
+  const upPort = upstream.server.address().port;
+  const proxy = startProxyOnPort(
+    { port: proxyPort }, // no routes -> prefix routing won't intercept
+    proxyPort,
+    { UPSTREAM_HOST: '127.0.0.1', UPSTREAM_PORT: String(upPort), UPSTREAM_SCHEME: 'http' }
+  );
+  return { upstream, proxy, upPort };
+}
+
+// Extract concatenated text from all text_delta events in an SSE stream.
+// The proxy's StreamingReverseMapper may legitimately split one logical text
+// across multiple text_delta events (it buffers pattern-suffix candidates);
+// the concatenation is what the client renders, so that's what we assert on.
+function extractDeltasText(sseText) {
+  const out = [];
+  const re = /"type":"text_delta","text":"((?:\\.|[^"\\])*)"/g;
+  let m;
+  while ((m = re.exec(sseText)) !== null) {
+    out.push(m[1].replace(/\\n/g,'\n').replace(/\\t/g,'\t').replace(/\\"/g,'"').replace(/\\\\/g,'\\'));
+  }
+  return out.join('');
+}
+async function teardown(proxy, upstream) {
+  await kill(proxy.child);
+  await new Promise((res) => upstream.server.close(res));
+  fs.rmSync(proxy.dir, { recursive: true, force: true });
+}
+
+test('disguise: advertises gzip,deflate,br,zstd upstream and decompresses gzip SSE', async () => {
+  const sse = [
+    'event: message_start\ndata: {"type":"message_start"}\n\n',
+    'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"pong"}}\n\n',
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+  ];
+  const { upstream, proxy } = await startStubAndProxy({ headers: { 'content-type': 'text/event-stream' }, sse, encoding: 'gzip' }, 19010);
+  try {
+    await waitForHealth(proxy.base);
+    const resp = await fetch(proxy.base + '/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': proxy.PROXY_KEY },
+      body: disguiseBody(true)
+    });
+    assert.strictEqual(resp.status, 200);
+    assert.strictEqual(resp.headers.get('content-encoding'), null, 'client must receive identity (no content-encoding)');
+    const text = await resp.text();
+    // transform is a no-op for these events; assert the concatenated delta text
+    assert.strictEqual(extractDeltasText(text), 'pong', 'text_delta concatenation after decompress');
+    // The proxy advertised gzip to the stub upstream:
+    assert.strictEqual(upstream.requests[0].headers['accept-encoding'], 'gzip, deflate, br, zstd');
+  } finally {
+    await teardown(proxy, upstream);
+  }
+});
+
+test('disguise: gzip SSE with reverseMap transform on a tool name', async () => {
+  // A text_delta containing a disguised (CC-style) tool name that the reverseMap
+  // should restore to the OpenClaw original. "Bash" is the CC name for "exec".
+  // input_json_delta carries a tool_call input with a quoted "Bash" tool name;
+  // reverseMap (quoted form "Bash"->"exec") restores it to the OpenClaw name.
+  const sse = [
+    'event: message_start\ndata: {"type":"message_start"}\n\n',
+    'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"Bash"}}\n\n',
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"ls\"}"}}\n\n',
+    'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+  ];
+  const { upstream, proxy } = await startStubAndProxy({ headers: { 'content-type': 'text/event-stream' }, sse, encoding: 'gzip' }, 19011);
+  try {
+    await waitForHealth(proxy.base);
+    const resp = await fetch(proxy.base + '/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': proxy.PROXY_KEY },
+      body: disguiseBody(true)
+    });
+    const text = await resp.text();
+    assert.ok(text.includes('"name":"exec"'), `reverseMap should restore "Bash"->"exec"; got: ${text.slice(0,300)}`);
+    assert.strictEqual(resp.headers.get('content-encoding'), null);
+  } finally {
+    await teardown(proxy, upstream);
+  }
+});
+
+test('disguise: chunked gzip SSE (one member per event) reassembles in order', async () => {
+  const sse = [
+    'event: message_start\ndata: {"type":"message_start"}\n\n',
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"AAA"}}\n\n',
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"BBB"}}\n\n',
+    'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+  ];
+  const { upstream, proxy } = await startStubAndProxy({ headers: { 'content-type': 'text/event-stream' }, sse, encoding: 'gzip' }, 19012);
+  try {
+    await waitForHealth(proxy.base);
+    const resp = await fetch(proxy.base + '/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': proxy.PROXY_KEY },
+      body: disguiseBody(true)
+    });
+    const text = await resp.text();
+    assert.strictEqual(extractDeltasText(text), 'AAABBB', 'chunked gzip reassembles to ordered delta text');
+  } finally {
+    await teardown(proxy, upstream);
+  }
+});
+
+test('disguise: brotli non-SSE JSON is decompressed then reverseMapped', async () => {
+  // Non-SSE JSON body containing a disguised tool name "Bash" that reverseMap
+  // turns back into "exec".
+  // A tool_use block whose name "Bash" reverseMap restores to "exec".
+  const payload = JSON.stringify({ id: 'msg_1', content: [{ type: 'tool_use', name: 'Bash', input: { command: 'ls' } }] });
+  const { upstream, proxy } = await startStubAndProxy({ status: 200, headers: { 'content-type': 'application/json' }, body: payload, encoding: 'br' }, 19013);
+  try {
+    await waitForHealth(proxy.base);
+    const resp = await fetch(proxy.base + '/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': proxy.PROXY_KEY },
+      body: disguiseBody(false)
+    });
+    assert.strictEqual(resp.status, 200);
+    assert.strictEqual(resp.headers.get('content-encoding'), null, 'client gets identity');
+    const json = await resp.json();
+    assert.strictEqual(json.content[0].name, 'exec', 'reverseMap ran on decompressed body');
+  } finally {
+    await teardown(proxy, upstream);
+  }
+});
+
+test('disguise: gzip error response is decompressed then reverseMapped', async () => {
+  // error body with a quoted "Bash" tool name reverseMap restores to "exec".
+  const payload = JSON.stringify({ type: 'error', error: { type: 'bad_request', message: 'tool "Bash" failed' } });
+  const { upstream, proxy } = await startStubAndProxy({ status: 400, headers: { 'content-type': 'application/json' }, body: payload, encoding: 'gzip' }, 19014);
+  try {
+    await waitForHealth(proxy.base);
+    const resp = await fetch(proxy.base + '/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': proxy.PROXY_KEY },
+      body: disguiseBody(false)
+    });
+    assert.strictEqual(resp.status, 400);
+    assert.strictEqual(resp.headers.get('content-encoding'), null, 'client gets identity even on error');
+    const json = await resp.json();
+    assert.strictEqual(json.error.message, 'tool "exec" failed', 'reverseMap ran on decompressed error body');
+  } finally {
+    await teardown(proxy, upstream);
+  }
+});
+
+test('disguise: identity (no content-encoding) SSE still works — regression guard', async () => {
+  const sse = [
+    'event: message_start\ndata: {"type":"message_start"}\n\n',
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n',
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+  ];
+  const { upstream, proxy } = await startStubAndProxy({ headers: { 'content-type': 'text/event-stream' }, sse }, 19015);
+  try {
+    await waitForHealth(proxy.base);
+    const resp = await fetch(proxy.base + '/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': proxy.PROXY_KEY },
+      body: disguiseBody(true)
+    });
+    const text = await resp.text();
+    assert.strictEqual(extractDeltasText(text), 'hi', 'identity SSE delta text unchanged');
+    assert.strictEqual(upstream.requests[0].headers['accept-encoding'], 'gzip, deflate, br, zstd');
+  } finally {
+    await teardown(proxy, upstream);
+  }
+});
+
+test('disguise: zstd SSE (Node 22+ only)', { skip: typeof zlib.zstdCompressSync !== 'function' }, async () => {
+  const sse = [
+    'event: message_start\ndata: {"type":"message_start"}\n\n',
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"pong"}}\n\n',
+    'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+  ];
+  const { upstream, proxy } = await startStubAndProxy({ headers: { 'content-type': 'text/event-stream' }, sse, encoding: 'zstd' }, 19016);
+  try {
+    await waitForHealth(proxy.base);
+    const resp = await fetch(proxy.base + '/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': proxy.PROXY_KEY },
+      body: disguiseBody(true)
+    });
+    const text = await resp.text();
+    assert.strictEqual(extractDeltasText(text), 'pong', 'zstd SSE decompresses to ordered delta text');
+    assert.strictEqual(resp.headers.get('content-encoding'), null);
+  } finally {
+    await teardown(proxy, upstream);
   }
 });

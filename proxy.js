@@ -253,6 +253,10 @@ function decompressionMode(contentEncoding) {
 function createDecompressor(mode) {
   switch (mode) {
     case 'gzip':    return zlib.createGunzip();
+    // Note: streaming inflate expects zlib-wrapped (RFC 1950) input. The buffered
+    // path (decompressBuffer) additionally falls back to inflateRawSync for raw
+    // RFC 1951. Anthropic returns gzip in practice, so this streaming limitation
+    // is low-risk; a raw-deflate SSE would emit 'error' and res.destroy().
     case 'deflate': return zlib.createInflate();
     case 'br':      return zlib.createBrotliDecompress();
     case 'zstd':    return zlib.createZstdDecompress();

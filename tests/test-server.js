@@ -517,3 +517,30 @@ test('disguise: zstd SSE (Node 22+ only)', { skip: typeof zlib.zstdCompressSync 
     await teardown(proxy, upstream);
   }
 });
+
+test('disguise: unsupported content-encoding falls through raw (transform skipped, content-encoding preserved)', async () => {
+  // An unknown encoding classifies as 'unsupported' → disguise skips the
+  // transform and forwards raw bytes with content-encoding preserved so the
+  // client can decode. Locks in the spec'd fallback (the zstd-on-Node-18 case
+  // rides this same arm).
+  const rawBody = Buffer.from('event: message_start\ndata: {"type":"message_start"}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n', 'utf8');
+  const { upstream, proxy } = await startStubAndProxy({
+    headers: { 'content-type': 'text/event-stream' },
+    raw: rawBody,
+    encoding: 'snappy' // unknown → unsupported
+  }, 19017);
+  try {
+    await waitForHealth(proxy.base);
+    const resp = await fetch(proxy.base + '/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': proxy.PROXY_KEY },
+      body: disguiseBody(true)
+    });
+    assert.strictEqual(resp.status, 200);
+    assert.strictEqual(resp.headers.get('content-encoding'), 'snappy', 'unsupported encoding is preserved for the client to decode');
+    const buf = Buffer.from(await resp.arrayBuffer());
+    assert.deepStrictEqual(buf, rawBody, 'raw bytes forwarded unchanged (transform skipped)');
+  } finally {
+    await teardown(proxy, upstream);
+  }
+});
